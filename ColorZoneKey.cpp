@@ -2,7 +2,8 @@
     ColorZoneKey.cpp - Win32 screen color monitor with keyboard trigger
 
     Build from a "Developer Command Prompt for VS":
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE ColorZoneKey.cpp user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
+        rc ColorZoneKey.rc
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -71,6 +72,8 @@ constexpr int DELAY_BEFORE_PRESS_MIN = 10;
 constexpr int DELAY_BEFORE_PRESS_MAX = 50;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 80;
+constexpr DWORD TOGGLE_HOTKEY = VK_F8;
+constexpr int IDI_APP_ICON = 1;
 
 // Capture loop pacing. Use 0 for max-speed polling, but 1-5ms is usually a better CPU/latency tradeoff.
 constexpr int CAPTURE_INTERVAL_MS = 2;
@@ -79,6 +82,7 @@ constexpr int CAPTURE_INTERVAL_MS = 2;
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
 constexpr UINT WM_APP_STATS = WM_APP + 3;
+constexpr int TOGGLE_HOTKEY_ID = 1;
 
 // Control identifiers.
 constexpr int IDC_START = 1001;
@@ -95,6 +99,7 @@ constexpr int IDC_HOLD_MAX = 1011;
 constexpr int IDC_INTERVAL = 1014;
 constexpr int IDC_APPLY = 1015;
 constexpr int IDC_HOLD_WHILE_VISIBLE = 1016;
+constexpr int IDC_TOGGLE_HOTKEY = 1017;
 
 enum class StatusKind : int {
     Disarmed,
@@ -113,6 +118,7 @@ struct RuntimeConfig {
     int keyHoldMax = KEY_HOLD_MAX;
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
     bool holdWhileVisible = false;
+    DWORD toggleHotkey = TOGGLE_HOTKEY;
 };
 
 struct FrameBuffer {
@@ -128,7 +134,9 @@ struct AppState {
     HWND start = nullptr;
     HWND stop = nullptr;
     HWND apply = nullptr;
+    HWND logo = nullptr;
     HWND stats = nullptr;
+    DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
@@ -654,8 +662,9 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_PRE_MAX, next.delayBeforePressMax) ||
         !ParseIntControl(hwnd, IDC_HOLD_MIN, next.keyHoldMin) ||
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
-        !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs)) {
-        error = L"One or more fields are invalid. Key accepts names like SPACE, A, ENTER, or F6.";
+        !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs) ||
+        !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
+        error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, or F6.";
         return false;
     }
 
@@ -705,6 +714,7 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
     SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
+    SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
 }
 
@@ -760,71 +770,96 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 
 void CreateMainControls(HWND hwnd) {
-    g_app.start = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  16, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
-    g_app.stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                 112, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
-    g_app.apply = CreateWindowExW(0, L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  208, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
+    HICON logoIcon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(IDI_APP_ICON),
+        IMAGE_ICON,
+        32,
+        32,
+        LR_DEFAULTCOLOR | LR_SHARED));
+    g_app.logo = CreateWindowExW(0, L"STATIC", nullptr,
+                                 WS_CHILD | WS_VISIBLE | SS_ICON,
+                                 16, 15, 36, 36,
+                                 hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (logoIcon) {
+        SendMessageW(g_app.logo, STM_SETICON, reinterpret_cast<WPARAM>(logoIcon), 0);
+    }
 
-    CreateLabel(hwnd, L"Status", 320, 21, 50, 20);
+    g_app.start = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  64, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
+    g_app.stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                 160, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
+    g_app.apply = CreateWindowExW(0, L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  256, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
+
+    CreateLabel(hwnd, L"Status", 380, 21, 60, 20);
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                   376, 16, 130, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+                                   450, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
 
     int y = 66;
-    constexpr int labelW = 130;
+    constexpr int labelW = 150;
     constexpr int editW = 90;
     constexpr int smallEditW = 70;
     constexpr int rowH = 24;
     constexpr int gap = 30;
+    constexpr int leftLabelX = 16;
+    constexpr int leftEditX = 190;
+    constexpr int leftUnitX = 292;
+    constexpr int rightLabelX = 350;
+    constexpr int rightEditX = 530;
+    constexpr int rightUnitX = 632;
 
-    CreateLabel(hwnd, L"Capture width", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_WIDTH, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", 252, y, 24, rowH);
-    CreateLabel(hwnd, L"Capture height", 276, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HEIGHT, 416, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", 512, y, 24, rowH);
-
-    y += gap;
-    CreateLabel(hwnd, L"Tolerance", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_TOLERANCE, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"RGB", 252, y, 36, rowH);
-    CreateLabel(hwnd, L"Key to press", 276, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_KEY, 416, y - 3, editW, rowH);
-
-    y += gap;
-    CreateLabel(hwnd, L"Delay before key", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_PRE_MIN, 156, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", 236, y, 24, rowH);
-    CreateEdit(hwnd, IDC_PRE_MAX, 266, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", 346, y, 30, rowH);
+    CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"px", leftUnitX, y, 30, rowH);
+    CreateLabel(hwnd, L"Capture height", rightLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_HEIGHT, rightEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"px", rightUnitX, y, 30, rowH);
 
     y += gap;
-    CreateLabel(hwnd, L"Key press length", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MIN, 156, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", 236, y, 24, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MAX, 266, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", 346, y, 30, rowH);
+    CreateLabel(hwnd, L"Tolerance", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_TOLERANCE, leftEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"RGB", leftUnitX, y, 48, rowH);
+    CreateLabel(hwnd, L"Key to press", rightLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 3, editW, rowH);
+
+    y += gap;
+    CreateLabel(hwnd, L"Delay before key", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_PRE_MIN, leftEditX, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
+    CreateEdit(hwnd, IDC_PRE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+
+    y += gap;
+    CreateLabel(hwnd, L"Key press length", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MIN, leftEditX, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
 
     y += gap;
     CreateWindowExW(0, L"BUTTON", L"Hold key while color is visible",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    16, y - 2, 250, rowH,
+                    leftLabelX, y - 2, 300, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_HOLD_WHILE_VISIBLE), GetModuleHandleW(nullptr), nullptr);
 
     y += gap;
-    CreateLabel(hwnd, L"Capture interval", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_INTERVAL, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"ms", 252, y, 30, rowH);
+    CreateLabel(hwnd, L"Capture interval", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_INTERVAL, leftEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
 
-    CreateLabel(hwnd, L"Live preview", 552, 16, 120, 20);
+    y += gap;
+    CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 3, editW, rowH);
+
+    CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"ColorZonePreview", L"",
                                     WS_CHILD | WS_VISIBLE,
-                                    552, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                    680, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
                                   WS_CHILD | WS_VISIBLE,
-                                  552, 250, 220, 20, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  680, 250, 280, 24, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -836,6 +871,19 @@ bool ApplyConfig(HWND hwnd) {
     if (!ReadConfigFromControls(hwnd, cfg, error)) {
         MessageBoxW(hwnd, error.c_str(), L"Invalid configuration", MB_ICONWARNING | MB_OK);
         return false;
+    }
+
+    if (g_app.registeredHotkey != cfg.toggleHotkey) {
+        if (g_app.registeredHotkey != 0) {
+            UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
+            g_app.registeredHotkey = 0;
+        }
+
+        if (!RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, cfg.toggleHotkey)) {
+            MessageBoxW(hwnd, L"That Start/Stop hotkey is already in use. Pick another key.", L"Hotkey unavailable", MB_ICONWARNING | MB_OK);
+            return false;
+        }
+        g_app.registeredHotkey = cfg.toggleHotkey;
     }
 
     {
@@ -863,11 +911,20 @@ void StopMonitoring() {
     EnableWindow(g_app.stop, FALSE);
 }
 
+void ToggleMonitoring(HWND hwnd) {
+    if (g_app.armed.load(std::memory_order_relaxed)) {
+        StopMonitoring();
+    } else {
+        StartMonitoring(hwnd);
+    }
+}
+
 LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         g_app.hwnd = hwnd;
         CreateMainControls(hwnd);
+        ApplyConfig(hwnd);
         g_app.worker = std::thread(WorkerMain);
         return 0;
 
@@ -884,6 +941,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         default:
             break;
+        }
+        break;
+
+    case WM_HOTKEY:
+        if (static_cast<int>(wParam) == TOGGLE_HOTKEY_ID) {
+            ToggleMonitoring(hwnd);
+            return 0;
         }
         break;
 
@@ -930,6 +994,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         g_app.shuttingDown.store(true, std::memory_order_relaxed);
         g_app.armed.store(false, std::memory_order_relaxed);
+        if (g_app.registeredHotkey != 0) {
+            UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
+            g_app.registeredHotkey = 0;
+        }
         if (g_app.worker.joinable()) {
             g_app.worker.join();
         }
@@ -957,6 +1025,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     mainClass.lpfnWndProc = MainProc;
     mainClass.hInstance = hInstance;
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    mainClass.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
     mainClass.lpszClassName = L"ColorZoneKeyWindow";
     mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     if (!RegisterClassW(&mainClass)) {
@@ -969,7 +1038,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"Color Zone Key Monitor",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        790, 300,
+        990, 360,
         nullptr,
         nullptr,
         hInstance,
