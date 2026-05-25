@@ -12,8 +12,8 @@
     What it does:
         - Captures a small zone centered on the virtual desktop.
         - Checks every captured pixel against the target RGB colors with a per-channel tolerance.
-        - When a match is found and cooldown has elapsed, sends a configurable keyboard press/release.
-        - Uses randomized pre-press, hold, and cooldown timing to avoid rigid machine-like cadence.
+        - When a match is found, sends a configurable keyboard press/release.
+        - Uses randomized pre-press and key-hold timing to avoid rigid machine-like cadence.
         - Runs capture/input on a background worker thread; the GUI remains responsive.
 
     Notes:
@@ -71,8 +71,6 @@ constexpr int DELAY_BEFORE_PRESS_MIN = 10;
 constexpr int DELAY_BEFORE_PRESS_MAX = 50;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 80;
-constexpr int COOLDOWN_MIN = 500;
-constexpr int COOLDOWN_MAX = 1500;
 
 // Capture loop pacing. Use 0 for max-speed polling, but 1-5ms is usually a better CPU/latency tradeoff.
 constexpr int CAPTURE_INTERVAL_MS = 2;
@@ -94,8 +92,6 @@ constexpr int IDC_PRE_MIN = 1008;
 constexpr int IDC_PRE_MAX = 1009;
 constexpr int IDC_HOLD_MIN = 1010;
 constexpr int IDC_HOLD_MAX = 1011;
-constexpr int IDC_COOL_MIN = 1012;
-constexpr int IDC_COOL_MAX = 1013;
 constexpr int IDC_INTERVAL = 1014;
 constexpr int IDC_APPLY = 1015;
 
@@ -114,8 +110,6 @@ struct RuntimeConfig {
     int delayBeforePressMax = DELAY_BEFORE_PRESS_MAX;
     int keyHoldMin = KEY_HOLD_MIN;
     int keyHoldMax = KEY_HOLD_MAX;
-    int cooldownMin = COOLDOWN_MIN;
-    int cooldownMax = COOLDOWN_MAX;
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
 };
 
@@ -369,7 +363,6 @@ void WorkerMain() {
     ScreenCapture capture;
     std::random_device rd;
     std::mt19937 rng(rd());
-    auto nextAllowed = std::chrono::steady_clock::now();
     auto nextStatsUi = std::chrono::steady_clock::now();
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
@@ -421,12 +414,11 @@ void WorkerMain() {
                 nextStatsUi = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             }
 
-            if (detection.detected && std::chrono::steady_clock::now() >= nextAllowed) {
+            if (detection.detected) {
                 PostStatus(StatusKind::Detected);
 
                 std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
                 std::uniform_int_distribution<int> holdDist(cfg.keyHoldMin, cfg.keyHoldMax);
-                std::uniform_int_distribution<int> coolDist(cfg.cooldownMin, cfg.cooldownMax);
 
                 InterruptibleSleepMs(preDist(rng), g_app.armed, g_app.shuttingDown);
 
@@ -435,8 +427,6 @@ void WorkerMain() {
                     SendKeyPress(cfg.targetKey, holdDist(rng), g_app.armed);
                 }
 
-                const int cooldownMs = coolDist(rng);
-                nextAllowed = std::chrono::steady_clock::now() + std::chrono::milliseconds(cooldownMs);
                 PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
             }
         }
@@ -467,17 +457,6 @@ bool ParseIntControl(HWND parent, int id, int& out) {
         return false;
     }
     out = static_cast<int>(value);
-    return true;
-}
-
-bool ParseDwordControl(HWND parent, int id, DWORD& out) {
-    const std::wstring text = GetWindowTextString(GetDlgItem(parent, id));
-    wchar_t* end = nullptr;
-    const unsigned long value = wcstoul(text.c_str(), &end, 0);
-    if (end == text.c_str() || value > 0xFFu) {
-        return false;
-    }
-    out = static_cast<DWORD>(value);
     return true;
 }
 
@@ -554,10 +533,47 @@ void SetControlInt(HWND parent, int id, int value) {
     SetWindowTextW(GetDlgItem(parent, id), buf);
 }
 
-void SetControlHex(HWND parent, int id, DWORD value) {
-    wchar_t buf[32]{};
-    wsprintfW(buf, L"0x%02X", value);
-    SetWindowTextW(GetDlgItem(parent, id), buf);
+std::wstring VirtualKeyDisplayName(DWORD vk) {
+    if (vk >= L'A' && vk <= L'Z') {
+        return std::wstring(1, static_cast<wchar_t>(vk));
+    }
+    if (vk >= L'0' && vk <= L'9') {
+        return std::wstring(1, static_cast<wchar_t>(vk));
+    }
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        wchar_t buf[8]{};
+        wsprintfW(buf, L"F%u", static_cast<unsigned>(vk - VK_F1 + 1));
+        return buf;
+    }
+
+    switch (vk) {
+    case VK_SPACE: return L"SPACE";
+    case VK_RETURN: return L"ENTER";
+    case VK_TAB: return L"TAB";
+    case VK_ESCAPE: return L"ESC";
+    case VK_SHIFT: return L"SHIFT";
+    case VK_CONTROL: return L"CTRL";
+    case VK_MENU: return L"ALT";
+    case VK_LEFT: return L"LEFT";
+    case VK_RIGHT: return L"RIGHT";
+    case VK_UP: return L"UP";
+    case VK_DOWN: return L"DOWN";
+    case VK_BACK: return L"BACKSPACE";
+    case VK_DELETE: return L"DELETE";
+    case VK_HOME: return L"HOME";
+    case VK_END: return L"END";
+    case VK_PRIOR: return L"PAGEUP";
+    case VK_NEXT: return L"PAGEDOWN";
+    default:
+        wchar_t buf[32]{};
+        wsprintfW(buf, L"%u", static_cast<unsigned>(vk));
+        return buf;
+    }
+}
+
+void SetControlKeyName(HWND parent, int id, DWORD value) {
+    const std::wstring name = VirtualKeyDisplayName(value);
+    SetWindowTextW(GetDlgItem(parent, id), name.c_str());
 }
 
 bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) {
@@ -571,10 +587,8 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_PRE_MAX, next.delayBeforePressMax) ||
         !ParseIntControl(hwnd, IDC_HOLD_MIN, next.keyHoldMin) ||
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
-        !ParseIntControl(hwnd, IDC_COOL_MIN, next.cooldownMin) ||
-        !ParseIntControl(hwnd, IDC_COOL_MAX, next.cooldownMax) ||
         !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs)) {
-        error = L"One or more fields are invalid. Key accepts names like SPACE, A, F6, or numeric codes like 0x20.";
+        error = L"One or more fields are invalid. Key accepts names like SPACE, A, ENTER, or F6.";
         return false;
     }
 
@@ -588,8 +602,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         return false;
     }
     if (next.delayBeforePressMin < 0 || next.delayBeforePressMax < next.delayBeforePressMin ||
-        next.keyHoldMin < 0 || next.keyHoldMax < next.keyHoldMin ||
-        next.cooldownMin < 0 || next.cooldownMax < next.cooldownMin) {
+        next.keyHoldMin < 0 || next.keyHoldMax < next.keyHoldMin) {
         error = L"Each timing range must be non-negative and min <= max.";
         return false;
     }
@@ -618,13 +631,11 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
     SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
     SetControlInt(hwnd, IDC_TOLERANCE, cfg.tolerance);
-    SetControlHex(hwnd, IDC_KEY, cfg.targetKey);
+    SetControlKeyName(hwnd, IDC_KEY, cfg.targetKey);
     SetControlInt(hwnd, IDC_PRE_MIN, cfg.delayBeforePressMin);
     SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
     SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
-    SetControlInt(hwnd, IDC_COOL_MIN, cfg.cooldownMin);
-    SetControlInt(hwnd, IDC_COOL_MAX, cfg.cooldownMax);
     SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
 }
 
@@ -695,6 +706,7 @@ void CreateMainControls(HWND hwnd) {
     int y = 66;
     constexpr int labelW = 130;
     constexpr int editW = 90;
+    constexpr int smallEditW = 70;
     constexpr int rowH = 24;
     constexpr int gap = 30;
 
@@ -706,26 +718,22 @@ void CreateMainControls(HWND hwnd) {
     y += gap;
     CreateLabel(hwnd, L"Tolerance", 16, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOLERANCE, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"Target VK", 276, y, labelW, rowH);
+    CreateLabel(hwnd, L"Key to press", 276, y, labelW, rowH);
     CreateEdit(hwnd, IDC_KEY, 416, y - 3, editW, rowH);
 
     y += gap;
-    CreateLabel(hwnd, L"Pre-press min", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_PRE_MIN, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"Pre-press max", 276, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_PRE_MAX, 416, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"Delay before key", 16, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_PRE_MIN, 156, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", 236, y, 24, rowH);
+    CreateEdit(hwnd, IDC_PRE_MAX, 266, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", 346, y, 30, rowH);
 
     y += gap;
-    CreateLabel(hwnd, L"Hold min", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MIN, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"Hold max", 276, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MAX, 416, y - 3, editW, rowH);
-
-    y += gap;
-    CreateLabel(hwnd, L"Cooldown min", 16, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOL_MIN, 156, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"Cooldown max", 276, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOL_MAX, 416, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"Key press length", 16, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MIN, 156, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", 236, y, 24, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MAX, 266, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", 346, y, 30, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Capture interval", 16, y, labelW, rowH);
