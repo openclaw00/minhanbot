@@ -80,6 +80,7 @@ constexpr int CAPTURE_INTERVAL_MS = 2;
 // GUI messages.
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
+constexpr UINT WM_APP_STATS = WM_APP + 3;
 
 // Control identifiers.
 constexpr int IDC_START = 1001;
@@ -131,9 +132,15 @@ struct AppState {
     HWND start = nullptr;
     HWND stop = nullptr;
     HWND apply = nullptr;
+    HWND stats = nullptr;
 
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
+    std::atomic_int lastHits{0};
+    std::atomic_int closestR{0};
+    std::atomic_int closestG{0};
+    std::atomic_int closestB{0};
+    std::atomic_int closestDelta{0};
     std::thread worker;
 
     std::mutex configMutex;
@@ -283,6 +290,43 @@ bool MatchTargetColors(const std::uint8_t* bgra, std::size_t pixels, int toleran
     return false;
 }
 
+struct DetectionResult {
+    bool detected = false;
+    int hits = 0;
+    RGB_COLOR closest{0, 0, 0};
+    int closestDelta = std::numeric_limits<int>::max();
+};
+
+DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance) {
+    DetectionResult result{};
+
+    for (std::size_t i = 0; i < pixels; ++i) {
+        const std::uint8_t b = bgra[i * 4 + 0];
+        const std::uint8_t g = bgra[i * 4 + 1];
+        const std::uint8_t r = bgra[i * 4 + 2];
+
+        for (const RGB_COLOR& target : TARGET_COLORS) {
+            const int dr = std::abs(static_cast<int>(r) - target.r);
+            const int dg = std::abs(static_cast<int>(g) - target.g);
+            const int db = std::abs(static_cast<int>(b) - target.b);
+            const int maxDelta = std::max({dr, dg, db});
+
+            if (maxDelta < result.closestDelta) {
+                result.closestDelta = maxDelta;
+                result.closest = {static_cast<int>(r), static_cast<int>(g), static_cast<int>(b)};
+            }
+
+            if (dr <= tolerance && dg <= tolerance && db <= tolerance) {
+                ++result.hits;
+                result.detected = true;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 bool SendKeyPress(DWORD vk, int holdMs, const std::atomic_bool& armed) {
     INPUT inputs[2]{};
 
@@ -326,6 +370,7 @@ void WorkerMain() {
     std::random_device rd;
     std::mt19937 rng(rd());
     auto nextAllowed = std::chrono::steady_clock::now();
+    auto nextStatsUi = std::chrono::steady_clock::now();
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
@@ -361,12 +406,22 @@ void WorkerMain() {
                 PostMessageW(g_app.hwnd, WM_APP_FRAME, 0, 0);
             }
 
-            const bool detected = MatchTargetColors(
+            const DetectionResult detection = AnalyzeTargetColors(
                 capture.data(),
                 static_cast<std::size_t>(capture.width()) * static_cast<std::size_t>(capture.height()),
                 cfg.tolerance);
 
-            if (detected && std::chrono::steady_clock::now() >= nextAllowed) {
+            g_app.lastHits.store(detection.hits, std::memory_order_relaxed);
+            g_app.closestR.store(detection.closest.r, std::memory_order_relaxed);
+            g_app.closestG.store(detection.closest.g, std::memory_order_relaxed);
+            g_app.closestB.store(detection.closest.b, std::memory_order_relaxed);
+            g_app.closestDelta.store(detection.closestDelta, std::memory_order_relaxed);
+            if (std::chrono::steady_clock::now() >= nextStatsUi) {
+                PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
+                nextStatsUi = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            }
+
+            if (detection.detected && std::chrono::steady_clock::now() >= nextAllowed) {
                 PostStatus(StatusKind::Detected);
 
                 std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
@@ -680,6 +735,9 @@ void CreateMainControls(HWND hwnd) {
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"ColorZonePreview", L"",
                                     WS_CHILD | WS_VISIBLE,
                                     552, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
+                                  WS_CHILD | WS_VISIBLE,
+                                  552, 250, 220, 20, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -761,6 +819,22 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         return 0;
+
+    case WM_APP_STATS: {
+        wchar_t text[128]{};
+        wsprintfW(
+            text,
+            L"Hits: %d  Closest RGB: %d,%d,%d  +/- %d",
+            g_app.lastHits.load(std::memory_order_relaxed),
+            g_app.closestR.load(std::memory_order_relaxed),
+            g_app.closestG.load(std::memory_order_relaxed),
+            g_app.closestB.load(std::memory_order_relaxed),
+            g_app.closestDelta.load(std::memory_order_relaxed));
+        if (g_app.stats) {
+            SetWindowTextW(g_app.stats, text);
+        }
+        return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
