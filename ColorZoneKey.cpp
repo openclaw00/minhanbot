@@ -43,6 +43,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <cwctype>
 #include <vector>
 
 // === CONFIGURATION ===
@@ -95,6 +96,7 @@ constexpr int IDC_HOLD_MAX = 1011;
 constexpr int IDC_COOL_MIN = 1012;
 constexpr int IDC_COOL_MAX = 1013;
 constexpr int IDC_INTERVAL = 1014;
+constexpr int IDC_APPLY = 1015;
 
 enum class StatusKind : int {
     Disarmed,
@@ -128,6 +130,7 @@ struct AppState {
     HWND status = nullptr;
     HWND start = nullptr;
     HWND stop = nullptr;
+    HWND apply = nullptr;
 
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
@@ -423,6 +426,73 @@ bool ParseDwordControl(HWND parent, int id, DWORD& out) {
     return true;
 }
 
+std::wstring TrimUpper(std::wstring value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](wchar_t ch) {
+        return iswspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](wchar_t ch) {
+        return iswspace(ch) != 0;
+    }).base();
+
+    if (first >= last) {
+        return L"";
+    }
+
+    std::wstring result(first, last);
+    std::transform(result.begin(), result.end(), result.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towupper(ch));
+    });
+    return result;
+}
+
+bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out) {
+    const std::wstring value = TrimUpper(GetWindowTextString(GetDlgItem(parent, id)));
+    if (value.empty()) {
+        return false;
+    }
+
+    if (value.size() == 1) {
+        const wchar_t ch = value[0];
+        if ((ch >= L'A' && ch <= L'Z') || (ch >= L'0' && ch <= L'9')) {
+            out = static_cast<DWORD>(ch);
+            return true;
+        }
+    }
+
+    struct KeyName {
+        const wchar_t* name;
+        DWORD vk;
+    };
+
+    static const KeyName names[] = {
+        {L"SPACE", VK_SPACE}, {L"VK_SPACE", VK_SPACE},
+        {L"ENTER", VK_RETURN}, {L"RETURN", VK_RETURN}, {L"VK_RETURN", VK_RETURN},
+        {L"TAB", VK_TAB}, {L"ESC", VK_ESCAPE}, {L"ESCAPE", VK_ESCAPE},
+        {L"SHIFT", VK_SHIFT}, {L"CTRL", VK_CONTROL}, {L"CONTROL", VK_CONTROL}, {L"ALT", VK_MENU},
+        {L"LEFT", VK_LEFT}, {L"RIGHT", VK_RIGHT}, {L"UP", VK_UP}, {L"DOWN", VK_DOWN},
+        {L"BACKSPACE", VK_BACK}, {L"DELETE", VK_DELETE}, {L"DEL", VK_DELETE},
+        {L"HOME", VK_HOME}, {L"END", VK_END}, {L"PAGEUP", VK_PRIOR}, {L"PAGEDOWN", VK_NEXT},
+        {L"F1", VK_F1}, {L"F2", VK_F2}, {L"F3", VK_F3}, {L"F4", VK_F4},
+        {L"F5", VK_F5}, {L"F6", VK_F6}, {L"F7", VK_F7}, {L"F8", VK_F8},
+        {L"F9", VK_F9}, {L"F10", VK_F10}, {L"F11", VK_F11}, {L"F12", VK_F12}
+    };
+
+    for (const KeyName& name : names) {
+        if (value == name.name) {
+            out = name.vk;
+            return true;
+        }
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long numeric = wcstoul(value.c_str(), &end, 0);
+    if (end == value.c_str() || *end != L'\0' || numeric > 0xFFu) {
+        return false;
+    }
+    out = static_cast<DWORD>(numeric);
+    return true;
+}
+
 void SetControlInt(HWND parent, int id, int value) {
     wchar_t buf[32]{};
     wsprintfW(buf, L"%d", value);
@@ -441,7 +511,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     if (!ParseIntControl(hwnd, IDC_WIDTH, next.captureWidth) ||
         !ParseIntControl(hwnd, IDC_HEIGHT, next.captureHeight) ||
         !ParseIntControl(hwnd, IDC_TOLERANCE, next.tolerance) ||
-        !ParseDwordControl(hwnd, IDC_KEY, next.targetKey) ||
+        !ParseVirtualKeyControl(hwnd, IDC_KEY, next.targetKey) ||
         !ParseIntControl(hwnd, IDC_PRE_MIN, next.delayBeforePressMin) ||
         !ParseIntControl(hwnd, IDC_PRE_MAX, next.delayBeforePressMax) ||
         !ParseIntControl(hwnd, IDC_HOLD_MIN, next.keyHoldMin) ||
@@ -449,7 +519,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_COOL_MIN, next.cooldownMin) ||
         !ParseIntControl(hwnd, IDC_COOL_MAX, next.cooldownMax) ||
         !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs)) {
-        error = L"One or more fields are not valid numbers.";
+        error = L"One or more fields are invalid. Key accepts names like SPACE, A, F6, or numeric codes like 0x20.";
         return false;
     }
 
@@ -475,19 +545,6 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
 
     cfg = next;
     return true;
-}
-
-void SetControlsEnabled(HWND hwnd, BOOL enabled) {
-    const int ids[] = {
-        IDC_WIDTH, IDC_HEIGHT, IDC_TOLERANCE, IDC_KEY,
-        IDC_PRE_MIN, IDC_PRE_MAX, IDC_HOLD_MIN, IDC_HOLD_MAX,
-        IDC_COOL_MIN, IDC_COOL_MAX, IDC_INTERVAL
-    };
-    for (int id : ids) {
-        EnableWindow(GetDlgItem(hwnd, id), enabled);
-    }
-    EnableWindow(g_app.start, enabled);
-    EnableWindow(g_app.stop, !enabled);
 }
 
 void CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
@@ -572,11 +629,13 @@ void CreateMainControls(HWND hwnd) {
                                   16, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
     g_app.stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                  112, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
+    g_app.apply = CreateWindowExW(0, L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  208, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
 
-    CreateLabel(hwnd, L"Status", 224, 21, 50, 20);
+    CreateLabel(hwnd, L"Status", 320, 21, 50, 20);
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                   280, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+                                   376, 16, 130, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
 
     int y = 66;
     constexpr int labelW = 130;
@@ -623,31 +682,40 @@ void CreateMainControls(HWND hwnd) {
                                     552, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     PopulateDefaults(hwnd);
-    SetControlsEnabled(hwnd, TRUE);
+    EnableWindow(g_app.stop, FALSE);
 }
 
-void StartMonitoring(HWND hwnd) {
+bool ApplyConfig(HWND hwnd) {
     RuntimeConfig cfg;
     std::wstring error;
     if (!ReadConfigFromControls(hwnd, cfg, error)) {
         MessageBoxW(hwnd, error.c_str(), L"Invalid configuration", MB_ICONWARNING | MB_OK);
-        return;
+        return false;
     }
 
     {
         std::lock_guard<std::mutex> lock(g_app.configMutex);
         g_app.config = cfg;
     }
+    return true;
+}
+
+void StartMonitoring(HWND hwnd) {
+    if (!ApplyConfig(hwnd)) {
+        return;
+    }
 
     g_app.armed.store(true, std::memory_order_relaxed);
     SetWindowTextW(g_app.status, L"Armed");
-    SetControlsEnabled(hwnd, FALSE);
+    EnableWindow(g_app.start, FALSE);
+    EnableWindow(g_app.stop, TRUE);
 }
 
 void StopMonitoring() {
     g_app.armed.store(false, std::memory_order_relaxed);
     SetWindowTextW(g_app.status, L"Disarmed");
-    SetControlsEnabled(g_app.hwnd, TRUE);
+    EnableWindow(g_app.start, TRUE);
+    EnableWindow(g_app.stop, FALSE);
 }
 
 LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -665,6 +733,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_STOP:
             StopMonitoring();
+            return 0;
+        case IDC_APPLY:
+            ApplyConfig(hwnd);
             return 0;
         default:
             break;
