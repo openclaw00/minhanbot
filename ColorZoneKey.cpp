@@ -12,7 +12,7 @@
     What it does:
         - Captures a small zone centered on the virtual desktop.
         - Checks every captured pixel against the target RGB colors with a per-channel tolerance.
-        - When a match is found, sends a configurable keyboard press/release.
+        - When a match is found, either taps the configured key or holds it until the color disappears.
         - Uses randomized pre-press and key-hold timing to avoid rigid machine-like cadence.
         - Runs capture/input on a background worker thread; the GUI remains responsive.
 
@@ -94,6 +94,7 @@ constexpr int IDC_HOLD_MIN = 1010;
 constexpr int IDC_HOLD_MAX = 1011;
 constexpr int IDC_INTERVAL = 1014;
 constexpr int IDC_APPLY = 1015;
+constexpr int IDC_HOLD_WHILE_VISIBLE = 1016;
 
 enum class StatusKind : int {
     Disarmed,
@@ -111,6 +112,7 @@ struct RuntimeConfig {
     int keyHoldMin = KEY_HOLD_MIN;
     int keyHoldMax = KEY_HOLD_MAX;
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
+    bool holdWhileVisible = false;
 };
 
 struct FrameBuffer {
@@ -344,6 +346,21 @@ bool SendKeyPress(DWORD vk, int holdMs, const std::atomic_bool& armed) {
     return true;
 }
 
+bool SendKeyDown(DWORD vk) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+    return SendInput(1, &input, sizeof(INPUT)) == 1;
+}
+
+void SendKeyUp(DWORD vk) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
 void InterruptibleSleepMs(int ms, const std::atomic_bool& armed, const std::atomic_bool& shuttingDown) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, ms));
     while (!shuttingDown.load(std::memory_order_relaxed) &&
@@ -364,9 +381,16 @@ void WorkerMain() {
     std::random_device rd;
     std::mt19937 rng(rd());
     auto nextStatsUi = std::chrono::steady_clock::now();
+    bool keyHeld = false;
+    DWORD heldKey = 0;
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
+            if (keyHeld) {
+                SendKeyUp(heldKey);
+                keyHeld = false;
+                heldKey = 0;
+            }
             Sleep(10);
             continue;
         }
@@ -414,7 +438,42 @@ void WorkerMain() {
                 nextStatsUi = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             }
 
-            if (detection.detected) {
+            if (cfg.holdWhileVisible) {
+                if (detection.detected) {
+                    PostStatus(StatusKind::Detected);
+
+                    if (keyHeld && heldKey != cfg.targetKey) {
+                        SendKeyUp(heldKey);
+                        keyHeld = false;
+                        heldKey = 0;
+                    }
+
+                    if (!keyHeld) {
+                        std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
+                        InterruptibleSleepMs(preDist(rng), g_app.armed, g_app.shuttingDown);
+
+                        if (g_app.armed.load(std::memory_order_relaxed) &&
+                            !g_app.shuttingDown.load(std::memory_order_relaxed) &&
+                            SendKeyDown(cfg.targetKey)) {
+                            keyHeld = true;
+                            heldKey = cfg.targetKey;
+                        }
+                    }
+                } else {
+                    if (keyHeld) {
+                        SendKeyUp(heldKey);
+                        keyHeld = false;
+                        heldKey = 0;
+                    }
+                    PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
+                }
+            } else if (detection.detected) {
+                if (keyHeld) {
+                    SendKeyUp(heldKey);
+                    keyHeld = false;
+                    heldKey = 0;
+                }
+
                 PostStatus(StatusKind::Detected);
 
                 std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
@@ -428,6 +487,10 @@ void WorkerMain() {
                 }
 
                 PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
+            } else if (keyHeld) {
+                SendKeyUp(heldKey);
+                keyHeld = false;
+                heldKey = 0;
             }
         }
 
@@ -436,6 +499,10 @@ void WorkerMain() {
         } else {
             std::this_thread::yield();
         }
+    }
+
+    if (keyHeld) {
+        SendKeyUp(heldKey);
     }
 }
 
@@ -594,11 +661,11 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
 
     if (next.captureWidth < 1 || next.captureWidth > 512 ||
         next.captureHeight < 1 || next.captureHeight > 512) {
-        error = L"Capture width and height must be between 1 and 512.";
+        error = L"Capture width and height must be between 1 and 512 px.";
         return false;
     }
     if (next.tolerance < 0 || next.tolerance > 255) {
-        error = L"Tolerance must be between 0 and 255.";
+        error = L"Tolerance must be between 0 and 255 RGB levels.";
         return false;
     }
     if (next.delayBeforePressMin < 0 || next.delayBeforePressMax < next.delayBeforePressMin ||
@@ -611,6 +678,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         return false;
     }
 
+    next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
     cfg = next;
     return true;
 }
@@ -637,6 +705,7 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
     SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
+    CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void DrawPreview(HWND hwnd, HDC hdc) {
@@ -712,12 +781,15 @@ void CreateMainControls(HWND hwnd) {
 
     CreateLabel(hwnd, L"Capture width", 16, y, labelW, rowH);
     CreateEdit(hwnd, IDC_WIDTH, 156, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"px", 252, y, 24, rowH);
     CreateLabel(hwnd, L"Capture height", 276, y, labelW, rowH);
     CreateEdit(hwnd, IDC_HEIGHT, 416, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"px", 512, y, 24, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Tolerance", 16, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOLERANCE, 156, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"RGB", 252, y, 36, rowH);
     CreateLabel(hwnd, L"Key to press", 276, y, labelW, rowH);
     CreateEdit(hwnd, IDC_KEY, 416, y - 3, editW, rowH);
 
@@ -736,8 +808,15 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"ms", 346, y, 30, rowH);
 
     y += gap;
+    CreateWindowExW(0, L"BUTTON", L"Hold key while color is visible",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    16, y - 2, 250, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_HOLD_WHILE_VISIBLE), GetModuleHandleW(nullptr), nullptr);
+
+    y += gap;
     CreateLabel(hwnd, L"Capture interval", 16, y, labelW, rowH);
     CreateEdit(hwnd, IDC_INTERVAL, 156, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"ms", 252, y, 30, rowH);
 
     CreateLabel(hwnd, L"Live preview", 552, 16, 120, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"ColorZonePreview", L"",

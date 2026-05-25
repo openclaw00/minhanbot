@@ -7,7 +7,7 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 - Captures a small zone centered on the virtual desktop.
 - Detects configured RGB target colors with per-channel tolerance.
 - Sends a configurable keyboard press/release using `SendInput`.
-- Provides runtime controls for capture size, tolerance, key to press, delay before key, key press length, and capture interval.
+- Provides runtime controls for capture size, tolerance, key to press, delay before key, key press length, hold-while-visible mode, and capture interval.
 - Shows a live zoomed preview of the monitored area.
 
 ## Build
