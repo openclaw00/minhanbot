@@ -1,9 +1,9 @@
 /*
-    ColorZoneKey.cpp - Win32 screen color monitor with keyboard trigger
+    minhanbot - Win32 screen color monitor with keyboard trigger
 
     Build from a "Developer Command Prompt for VS":
         rc ColorZoneKey.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -48,10 +48,10 @@
 #include <vector>
 
 // === CONFIGURATION ===
-constexpr int CAPTURE_WIDTH = 40;
-constexpr int CAPTURE_HEIGHT = 40;
-constexpr int COLOR_TOLERANCE = 10;
-constexpr DWORD TARGET_KEY = VK_SPACE; // Virtual key code
+constexpr int CAPTURE_WIDTH = 25;
+constexpr int CAPTURE_HEIGHT = 25;
+constexpr int COLOR_TOLERANCE = 40;
+constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
 
 struct RGB_COLOR {
     int r;
@@ -68,15 +68,15 @@ const RGB_COLOR TARGET_COLORS[] = {
 };
 
 // Humanization / cadence jitter timing (milliseconds).
-constexpr int DELAY_BEFORE_PRESS_MIN = 10;
-constexpr int DELAY_BEFORE_PRESS_MAX = 50;
+constexpr int DELAY_BEFORE_PRESS_MIN = 100;
+constexpr int DELAY_BEFORE_PRESS_MAX = 175;
 constexpr int KEY_HOLD_MIN = 20;
-constexpr int KEY_HOLD_MAX = 80;
+constexpr int KEY_HOLD_MAX = 100;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
 constexpr int IDI_APP_ICON = 1;
 
 // Capture loop pacing. Use 0 for max-speed polling, but 1-5ms is usually a better CPU/latency tradeoff.
-constexpr int CAPTURE_INTERVAL_MS = 2;
+constexpr int CAPTURE_INTERVAL_MS = 5;
 
 // GUI messages.
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
@@ -117,7 +117,7 @@ struct RuntimeConfig {
     int keyHoldMin = KEY_HOLD_MIN;
     int keyHoldMax = KEY_HOLD_MAX;
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
-    bool holdWhileVisible = false;
+    bool holdWhileVisible = true;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
 };
 
@@ -1026,7 +1026,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     mainClass.hInstance = hInstance;
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
-    mainClass.lpszClassName = L"ColorZoneKeyWindow";
+    mainClass.lpszClassName = L"minhanbotWindow";
     mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     if (!RegisterClassW(&mainClass)) {
         return 1;
@@ -1035,7 +1035,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     HWND hwnd = CreateWindowExW(
         0,
         mainClass.lpszClassName,
-        L"Color Zone Key Monitor",
+        L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
         990, 360,
