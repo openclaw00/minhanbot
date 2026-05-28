@@ -37,8 +37,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <random>
@@ -100,11 +102,18 @@ constexpr int IDC_INTERVAL = 1014;
 constexpr int IDC_APPLY = 1015;
 constexpr int IDC_HOLD_WHILE_VISIBLE = 1016;
 constexpr int IDC_TOGGLE_HOTKEY = 1017;
+constexpr int IDC_EXTERNAL_HID = 1018;
+constexpr int IDC_SERIAL_PORT = 1019;
 
 enum class StatusKind : int {
     Disarmed,
     Armed,
     Detected
+};
+
+enum class InputBackend : int {
+    SendInput,
+    SerialHid
 };
 
 struct RuntimeConfig {
@@ -119,6 +128,8 @@ struct RuntimeConfig {
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
     bool holdWhileVisible = true;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
+    InputBackend inputBackend = InputBackend::SendInput;
+    std::wstring serialPort = L"COM4";
 };
 
 struct FrameBuffer {
@@ -331,43 +342,146 @@ DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels
     return result;
 }
 
-bool SendKeyPress(DWORD vk, int holdMs, const std::atomic_bool& armed) {
-    INPUT inputs[2]{};
-
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = static_cast<WORD>(vk);
-
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = static_cast<WORD>(vk);
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    if (SendInput(1, &inputs[0], sizeof(INPUT)) != 1) {
-        return false;
-    }
-
-    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(holdMs);
-    while (armed.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < end) {
-        Sleep(1);
-    }
-
-    SendInput(1, &inputs[1], sizeof(INPUT));
-    return true;
-}
-
-bool SendKeyDown(DWORD vk) {
+bool SendInputKeyDown(DWORD vk) {
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = static_cast<WORD>(vk);
     return SendInput(1, &input, sizeof(INPUT)) == 1;
 }
 
-void SendKeyUp(DWORD vk) {
+void SendInputKeyUp(DWORD vk) {
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = static_cast<WORD>(vk);
     input.ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(1, &input, sizeof(INPUT));
 }
+
+class SerialHidBridge {
+public:
+    SerialHidBridge() = default;
+
+    SerialHidBridge(const SerialHidBridge&) = delete;
+    SerialHidBridge& operator=(const SerialHidBridge&) = delete;
+
+    ~SerialHidBridge() {
+        close();
+    }
+
+    bool send(bool down, DWORD vk, const std::wstring& port) {
+        if (!ensureOpen(port)) {
+            return false;
+        }
+
+        char command[32]{};
+        std::snprintf(command, sizeof(command), "%c %02X\n", down ? 'D' : 'U', static_cast<unsigned>(vk & 0xFFu));
+
+        DWORD written = 0;
+        const DWORD length = static_cast<DWORD>(std::strlen(command));
+        if (!WriteFile(handle_, command, length, &written, nullptr) || written != length) {
+            close();
+            return false;
+        }
+        return true;
+    }
+
+private:
+    bool ensureOpen(const std::wstring& port) {
+        if (handle_ != INVALID_HANDLE_VALUE && port == openPort_) {
+            return true;
+        }
+
+        close();
+
+        std::wstring path = port;
+        if (path.rfind(L"\\\\.\\", 0) != 0) {
+            path = L"\\\\.\\" + path;
+        }
+
+        handle_ = CreateFileW(
+            path.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        DCB dcb{};
+        dcb.DCBlength = sizeof(dcb);
+        if (!GetCommState(handle_, &dcb)) {
+            close();
+            return false;
+        }
+        dcb.BaudRate = CBR_115200;
+        dcb.ByteSize = 8;
+        dcb.Parity = NOPARITY;
+        dcb.StopBits = ONESTOPBIT;
+        dcb.fDtrControl = DTR_CONTROL_DISABLE;
+        dcb.fRtsControl = RTS_CONTROL_DISABLE;
+        if (!SetCommState(handle_, &dcb)) {
+            close();
+            return false;
+        }
+
+        COMMTIMEOUTS timeouts{};
+        timeouts.WriteTotalTimeoutConstant = 20;
+        timeouts.WriteTotalTimeoutMultiplier = 1;
+        SetCommTimeouts(handle_, &timeouts);
+
+        openPort_ = port;
+        return true;
+    }
+
+    void close() {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+        openPort_.clear();
+    }
+
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    std::wstring openPort_;
+};
+
+class KeyOutput {
+public:
+    bool down(const RuntimeConfig& cfg, DWORD vk) {
+        if (cfg.inputBackend == InputBackend::SerialHid) {
+            return serial_.send(true, vk, cfg.serialPort);
+        }
+        return SendInputKeyDown(vk);
+    }
+
+    void up(const RuntimeConfig& cfg, DWORD vk) {
+        if (cfg.inputBackend == InputBackend::SerialHid) {
+            serial_.send(false, vk, cfg.serialPort);
+            return;
+        }
+        SendInputKeyUp(vk);
+    }
+
+    bool press(const RuntimeConfig& cfg, DWORD vk, int holdMs, const std::atomic_bool& armed) {
+        if (!down(cfg, vk)) {
+            return false;
+        }
+
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(holdMs);
+        while (armed.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < end) {
+            Sleep(1);
+        }
+
+        up(cfg, vk);
+        return true;
+    }
+
+private:
+    SerialHidBridge serial_;
+};
 
 void InterruptibleSleepMs(int ms, const std::atomic_bool& armed, const std::atomic_bool& shuttingDown) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, ms));
@@ -386,16 +500,18 @@ void PostStatus(StatusKind status) {
 
 void WorkerMain() {
     ScreenCapture capture;
+    KeyOutput output;
     std::random_device rd;
     std::mt19937 rng(rd());
     auto nextStatsUi = std::chrono::steady_clock::now();
     bool keyHeld = false;
     DWORD heldKey = 0;
+    RuntimeConfig heldConfig;
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
             if (keyHeld) {
-                SendKeyUp(heldKey);
+                output.up(heldConfig, heldKey);
                 keyHeld = false;
                 heldKey = 0;
             }
@@ -451,7 +567,7 @@ void WorkerMain() {
                     PostStatus(StatusKind::Detected);
 
                     if (keyHeld && heldKey != cfg.targetKey) {
-                        SendKeyUp(heldKey);
+                        output.up(heldConfig, heldKey);
                         keyHeld = false;
                         heldKey = 0;
                     }
@@ -462,14 +578,15 @@ void WorkerMain() {
 
                         if (g_app.armed.load(std::memory_order_relaxed) &&
                             !g_app.shuttingDown.load(std::memory_order_relaxed) &&
-                            SendKeyDown(cfg.targetKey)) {
+                            output.down(cfg, cfg.targetKey)) {
                             keyHeld = true;
                             heldKey = cfg.targetKey;
+                            heldConfig = cfg;
                         }
                     }
                 } else {
                     if (keyHeld) {
-                        SendKeyUp(heldKey);
+                        output.up(heldConfig, heldKey);
                         keyHeld = false;
                         heldKey = 0;
                     }
@@ -477,7 +594,7 @@ void WorkerMain() {
                 }
             } else if (detection.detected) {
                 if (keyHeld) {
-                    SendKeyUp(heldKey);
+                    output.up(heldConfig, heldKey);
                     keyHeld = false;
                     heldKey = 0;
                 }
@@ -491,12 +608,12 @@ void WorkerMain() {
 
                 if (g_app.armed.load(std::memory_order_relaxed) &&
                     !g_app.shuttingDown.load(std::memory_order_relaxed)) {
-                    SendKeyPress(cfg.targetKey, holdDist(rng), g_app.armed);
+                    output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed);
                 }
 
                 PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
             } else if (keyHeld) {
-                SendKeyUp(heldKey);
+                output.up(heldConfig, heldKey);
                 keyHeld = false;
                 heldKey = 0;
             }
@@ -510,7 +627,7 @@ void WorkerMain() {
     }
 
     if (keyHeld) {
-        SendKeyUp(heldKey);
+        output.up(heldConfig, heldKey);
     }
 }
 
@@ -651,6 +768,21 @@ void SetControlKeyName(HWND parent, int id, DWORD value) {
     SetWindowTextW(GetDlgItem(parent, id), name.c_str());
 }
 
+bool IsSerialPortNameValid(const std::wstring& value) {
+    if (value.size() < 4 || value.size() > 10) {
+        return false;
+    }
+    if (value.rfind(L"COM", 0) != 0) {
+        return false;
+    }
+    for (std::size_t i = 3; i < value.size(); ++i) {
+        if (iswdigit(value[i]) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) {
     RuntimeConfig next{};
 
@@ -688,6 +820,15 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     }
 
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
+    next.inputBackend = IsDlgButtonChecked(hwnd, IDC_EXTERNAL_HID) == BST_CHECKED
+        ? InputBackend::SerialHid
+        : InputBackend::SendInput;
+    next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
+    if (next.inputBackend == InputBackend::SerialHid && !IsSerialPortNameValid(next.serialPort)) {
+        error = L"Serial HID mode needs a COM port like COM4.";
+        return false;
+    }
+
     cfg = next;
     return true;
 }
@@ -715,7 +856,9 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
     SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
     SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_EXTERNAL_HID, cfg.inputBackend == InputBackend::SerialHid ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void DrawPreview(HWND hwnd, HDC hdc) {
@@ -852,6 +995,13 @@ void CreateMainControls(HWND hwnd) {
     y += gap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 3, editW, rowH);
+
+    CreateWindowExW(0, L"BUTTON", L"External USB HID",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    rightLabelX, y - 2, 160, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_EXTERNAL_HID), GetModuleHandleW(nullptr), nullptr);
+    CreateLabel(hwnd, L"Port", rightEditX, y, 34, rowH);
+    CreateEdit(hwnd, IDC_SERIAL_PORT, rightEditX + 42, y - 3, 70, rowH);
 
     CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"ColorZonePreview", L"",
