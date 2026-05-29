@@ -28,21 +28,21 @@ The desktop app still does detection and timing. The board receives commands suc
 From a Visual Studio Developer Command Prompt:
 
 ```bat
-rc ColorZoneKey.rc
-cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+rc minhanbot.rc
+cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 ```
 
 Cross-compile from macOS/Linux with MinGW-w64:
 
 ```sh
-x86_64-w64-mingw32-windres ColorZoneKey.rc -O coff -o ColorZoneKey.res
-x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ ColorZoneKey.cpp ColorZoneKey.res -o minhanbot.exe -luser32 -lgdi32 -ld3d11 -ldxgi
+x86_64-w64-mingw32-windres minhanbot.rc -O coff -o minhanbot.res
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ minhanbot.cpp minhanbot.res -o minhanbot.exe -luser32 -lgdi32 -ld3d11 -ldxgi
 ```
 
 ## Files
 
-- `ColorZoneKey.cpp` - complete single-file Win32 source.
-- `ColorZoneKey.rc` - Windows icon resource.
+- `minhanbot.cpp` - complete single-file Win32 source.
+- `minhanbot.rc` - Windows icon resource.
 - `firmware/serial-hid-bridge/serial-hid-bridge.ino` - optional external USB HID bridge firmware.
 - `assets/app-logo.png` and `assets/app.ico` - app logo and executable icon.
 - `minhanbot.exe` - Windows x64 GUI build.

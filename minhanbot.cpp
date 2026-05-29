@@ -2,8 +2,8 @@
     minhanbot - Win32 screen color monitor with keyboard trigger
 
     Build from a "Developer Command Prompt for VS":
-        rc ColorZoneKey.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+        rc minhanbot.rc
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -156,7 +156,6 @@ struct AppState {
     HWND start = nullptr;
     HWND stop = nullptr;
     HWND apply = nullptr;
-    HWND logo = nullptr;
     HWND stats = nullptr;
     DWORD registeredHotkey = 0;
 
@@ -1116,32 +1115,17 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 
 void CreateMainControls(HWND hwnd) {
-    HICON logoIcon = static_cast<HICON>(LoadImageW(
-        GetModuleHandleW(nullptr),
-        MAKEINTRESOURCEW(IDI_APP_ICON),
-        IMAGE_ICON,
-        32,
-        32,
-        LR_DEFAULTCOLOR | LR_SHARED));
-    g_app.logo = CreateWindowExW(0, L"STATIC", nullptr,
-                                 WS_CHILD | WS_VISIBLE | SS_ICON,
-                                 16, 15, 36, 36,
-                                 hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (logoIcon) {
-        SendMessageW(g_app.logo, STM_SETICON, reinterpret_cast<WPARAM>(logoIcon), 0);
-    }
-
     g_app.start = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  64, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
+                                  16, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
     g_app.stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                 160, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
+                                 112, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
     g_app.apply = CreateWindowExW(0, L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  256, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
+                                  208, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
 
-    CreateLabel(hwnd, L"Status", 380, 21, 60, 20);
+    CreateLabel(hwnd, L"Status", 360, 21, 60, 20);
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                   450, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+                                   430, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
 
     int y = 66;
     constexpr int labelW = 150;
@@ -1152,9 +1136,9 @@ void CreateMainControls(HWND hwnd) {
     constexpr int leftLabelX = 16;
     constexpr int leftEditX = 190;
     constexpr int leftUnitX = 292;
-    constexpr int rightLabelX = 350;
-    constexpr int rightEditX = 530;
-    constexpr int rightUnitX = 632;
+    constexpr int rightLabelX = 420;
+    constexpr int rightEditX = 560;
+    constexpr int rightUnitX = 662;
 
     CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
@@ -1217,7 +1201,7 @@ void CreateMainControls(HWND hwnd) {
     CreateEdit(hwnd, IDC_SERIAL_PORT, rightEditX + 42, y - 3, 70, rowH);
 
     CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
-    g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"ColorZonePreview", L"",
+    g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
                                     WS_CHILD | WS_VISIBLE,
                                     680, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
@@ -1379,7 +1363,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     previewClass.lpfnWndProc = PreviewProc;
     previewClass.hInstance = hInstance;
     previewClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    previewClass.lpszClassName = L"ColorZonePreview";
+    previewClass.lpszClassName = L"minhanbotPreview";
     previewClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     if (!RegisterClassW(&previewClass)) {
         return 1;
