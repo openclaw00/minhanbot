@@ -1043,6 +1043,14 @@ void PopulateHitThresholdChoices(HWND combo) {
     }
 }
 
+void PopulateSerialPortChoices(HWND combo) {
+    for (int port = 1; port <= 20; ++port) {
+        wchar_t text[16]{};
+        wsprintfW(text, L"COM%d", port);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
+    }
+}
+
 void PopulateDefaults(HWND hwnd) {
     const RuntimeConfig cfg{};
     SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
@@ -1198,7 +1206,8 @@ void CreateMainControls(HWND hwnd) {
                     rightLabelX, y - 2, 160, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_EXTERNAL_HID), GetModuleHandleW(nullptr), nullptr);
     CreateLabel(hwnd, L"Port", rightEditX, y, 34, rowH);
-    CreateEdit(hwnd, IDC_SERIAL_PORT, rightEditX + 42, y - 3, 70, rowH);
+    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX + 42, y - 3, 92, 180);
+    PopulateSerialPortChoices(serialPort);
 
     CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
