@@ -3,7 +3,7 @@
 
     Build from a "Developer Command Prompt for VS":
         rc ColorZoneKey.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe ColorZoneKey.cpp ColorZoneKey.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -13,6 +13,7 @@
     What it does:
         - Captures a small zone centered on the virtual desktop.
         - Checks every captured pixel against the target RGB colors with a per-channel tolerance.
+        - Requires a configurable number of matching color pixels before triggering.
         - When a match is found, either taps the configured key or holds it until the color disappears.
         - Uses randomized pre-press and key-hold timing to avoid rigid machine-like cadence.
         - Runs capture/input on a background worker thread; the GUI remains responsive.
@@ -20,9 +21,8 @@
     Notes:
         - This is keyboard-only input injection via SendInput().
         - Compile as a Windows subsystem application; no console window is used.
-        - BitBlt into a 32-bit top-down DIB is used because it has very low overhead for tiny regions
-          like 40x40 pixels. Desktop Duplication is excellent for full-frame pipelines but adds setup
-          and frame-acquisition complexity that usually does not pay off for this small centered zone.
+        - DXGI Desktop Duplication is used to capture the output containing the center of the
+          virtual desktop, then a small centered region is copied into a CPU-readable texture.
 */
 
 #ifndef UNICODE
@@ -33,6 +33,8 @@
 #endif
 
 #include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +55,7 @@
 constexpr int CAPTURE_WIDTH = 25;
 constexpr int CAPTURE_HEIGHT = 25;
 constexpr int COLOR_TOLERANCE = 40;
+constexpr int MIN_COLOR_PIXELS = 1;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
 
 struct RGB_COLOR {
@@ -74,11 +77,13 @@ constexpr int DELAY_BEFORE_PRESS_MIN = 100;
 constexpr int DELAY_BEFORE_PRESS_MAX = 175;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
+constexpr int RELEASE_DELAY_MIN = 20;
+constexpr int RELEASE_DELAY_MAX = 100;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
 constexpr int IDI_APP_ICON = 1;
 
-// Capture loop pacing. Use 0 for max-speed polling, but 1-5ms is usually a better CPU/latency tradeoff.
-constexpr int CAPTURE_INTERVAL_MS = 5;
+// Capture loop pacing. Use 0 for max-speed polling, but 10ms is a balanced default.
+constexpr int CAPTURE_INTERVAL_MS = 10;
 
 // GUI messages.
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
@@ -98,12 +103,15 @@ constexpr int IDC_PRE_MIN = 1008;
 constexpr int IDC_PRE_MAX = 1009;
 constexpr int IDC_HOLD_MIN = 1010;
 constexpr int IDC_HOLD_MAX = 1011;
+constexpr int IDC_RELEASE_MIN = 1012;
+constexpr int IDC_RELEASE_MAX = 1013;
 constexpr int IDC_INTERVAL = 1014;
 constexpr int IDC_APPLY = 1015;
 constexpr int IDC_HOLD_WHILE_VISIBLE = 1016;
 constexpr int IDC_TOGGLE_HOTKEY = 1017;
 constexpr int IDC_EXTERNAL_HID = 1018;
 constexpr int IDC_SERIAL_PORT = 1019;
+constexpr int IDC_MIN_COLOR_PIXELS = 1020;
 
 enum class StatusKind : int {
     Disarmed,
@@ -120,11 +128,14 @@ struct RuntimeConfig {
     int captureWidth = CAPTURE_WIDTH;
     int captureHeight = CAPTURE_HEIGHT;
     int tolerance = COLOR_TOLERANCE;
+    int minColorPixels = MIN_COLOR_PIXELS;
     DWORD targetKey = TARGET_KEY;
     int delayBeforePressMin = DELAY_BEFORE_PRESS_MIN;
     int delayBeforePressMax = DELAY_BEFORE_PRESS_MAX;
     int keyHoldMin = KEY_HOLD_MIN;
     int keyHoldMax = KEY_HOLD_MAX;
+    int releaseDelayMin = RELEASE_DELAY_MIN;
+    int releaseDelayMax = RELEASE_DELAY_MAX;
     int captureIntervalMs = CAPTURE_INTERVAL_MS;
     bool holdWhileVisible = true;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
@@ -152,6 +163,7 @@ struct AppState {
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
     std::atomic_int lastHits{0};
+    std::atomic_int requiredHits{MIN_COLOR_PIXELS};
     std::atomic_int closestR{0};
     std::atomic_int closestG{0};
     std::atomic_int closestB{0};
@@ -167,6 +179,18 @@ struct AppState {
 
 AppState g_app;
 
+template <typename T>
+void SafeRelease(T*& ptr) {
+    if (ptr) {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+int ClampInt(int value, int lo, int hi) {
+    return std::max(lo, std::min(value, hi));
+}
+
 class ScreenCapture {
 public:
     ScreenCapture() = default;
@@ -179,50 +203,36 @@ public:
     }
 
     bool ensure(int width, int height) {
-        if (width == width_ && height == height_ && memDc_ && bits_) {
+        if (width == width_ && height == height_ && duplication_ && staging_ && !bgra_.empty()) {
             return true;
         }
 
         reset();
 
-        screenDc_ = GetDC(nullptr);
-        if (!screenDc_) {
+        HRESULT hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            nullptr,
+            0,
+            D3D11_SDK_VERSION,
+            &device_,
+            nullptr,
+            &context_);
+        if (FAILED(hr)) {
             return false;
         }
 
-        memDc_ = CreateCompatibleDC(screenDc_);
-        if (!memDc_) {
+        IDXGIDevice* dxgiDevice = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        hr = device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
+        if (SUCCEEDED(hr)) {
+            hr = dxgiDevice->GetAdapter(&adapter);
+        }
+        SafeRelease(dxgiDevice);
+        if (FAILED(hr) || !adapter) {
             reset();
-            return false;
-        }
-
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -height; // top-down rows, easier preview and scanning
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        dib_ = CreateDIBSection(memDc_, &bmi, DIB_RGB_COLORS, &bits_, nullptr, 0);
-        if (!dib_ || !bits_) {
-            reset();
-            return false;
-        }
-
-        oldBitmap_ = static_cast<HBITMAP>(SelectObject(memDc_, dib_));
-        if (!oldBitmap_) {
-            reset();
-            return false;
-        }
-
-        width_ = width;
-        height_ = height;
-        return true;
-    }
-
-    bool captureCentered() {
-        if (!memDc_ || !screenDc_ || !bits_) {
             return false;
         }
 
@@ -230,14 +240,147 @@ public:
         const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        const int x = vx + (vw - width_) / 2;
-        const int y = vy + (vh - height_) / 2;
+        const int centerX = vx + vw / 2;
+        const int centerY = vy + vh / 2;
 
-        return BitBlt(memDc_, 0, 0, width_, height_, screenDc_, x, y, SRCCOPY | CAPTUREBLT) != FALSE;
+        IDXGIOutput* selectedOutput = nullptr;
+        DXGI_OUTPUT_DESC selectedDesc{};
+        for (UINT index = 0; ; ++index) {
+            IDXGIOutput* output = nullptr;
+            if (adapter->EnumOutputs(index, &output) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+
+            DXGI_OUTPUT_DESC desc{};
+            if (output && SUCCEEDED(output->GetDesc(&desc))) {
+                const RECT& rc = desc.DesktopCoordinates;
+                if (centerX >= rc.left && centerX < rc.right && centerY >= rc.top && centerY < rc.bottom) {
+                    selectedOutput = output;
+                    selectedDesc = desc;
+                    break;
+                }
+            }
+            SafeRelease(output);
+        }
+        SafeRelease(adapter);
+
+        if (!selectedOutput) {
+            reset();
+            return false;
+        }
+
+        IDXGIOutput1* output1 = nullptr;
+        hr = selectedOutput->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
+        SafeRelease(selectedOutput);
+        if (FAILED(hr) || !output1) {
+            reset();
+            return false;
+        }
+
+        hr = output1->DuplicateOutput(device_, &duplication_);
+        SafeRelease(output1);
+        if (FAILED(hr)) {
+            reset();
+            return false;
+        }
+
+        outputLeft_ = selectedDesc.DesktopCoordinates.left;
+        outputTop_ = selectedDesc.DesktopCoordinates.top;
+        outputWidth_ = selectedDesc.DesktopCoordinates.right - selectedDesc.DesktopCoordinates.left;
+        outputHeight_ = selectedDesc.DesktopCoordinates.bottom - selectedDesc.DesktopCoordinates.top;
+        if (width > outputWidth_ || height > outputHeight_) {
+            reset();
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC textureDesc{};
+        textureDesc.Width = static_cast<UINT>(width);
+        textureDesc.Height = static_cast<UINT>(height);
+        textureDesc.MipLevels = 1;
+        textureDesc.ArraySize = 1;
+        textureDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.Usage = D3D11_USAGE_STAGING;
+        textureDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        hr = device_->CreateTexture2D(&textureDesc, nullptr, &staging_);
+        if (FAILED(hr)) {
+            reset();
+            return false;
+        }
+
+        width_ = width;
+        height_ = height;
+        bgra_.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4u, 0);
+        return true;
+    }
+
+    bool captureCentered() {
+        if (!duplication_ || !context_ || !staging_) {
+            return false;
+        }
+
+        const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        const int desiredX = vx + (vw - width_) / 2;
+        const int desiredY = vy + (vh - height_) / 2;
+        const int localX = ClampInt(desiredX - outputLeft_, 0, outputWidth_ - width_);
+        const int localY = ClampInt(desiredY - outputTop_, 0, outputHeight_ - height_);
+
+        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+        IDXGIResource* frameResource = nullptr;
+        HRESULT hr = duplication_->AcquireNextFrame(0, &frameInfo, &frameResource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            return !bgra_.empty();
+        }
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            reset();
+            return false;
+        }
+        if (FAILED(hr) || !frameResource) {
+            return false;
+        }
+
+        ID3D11Texture2D* frameTexture = nullptr;
+        hr = frameResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&frameTexture));
+        SafeRelease(frameResource);
+        if (FAILED(hr) || !frameTexture) {
+            duplication_->ReleaseFrame();
+            return false;
+        }
+
+        D3D11_BOX srcBox{};
+        srcBox.left = static_cast<UINT>(localX);
+        srcBox.top = static_cast<UINT>(localY);
+        srcBox.front = 0;
+        srcBox.right = static_cast<UINT>(localX + width_);
+        srcBox.bottom = static_cast<UINT>(localY + height_);
+        srcBox.back = 1;
+        context_->CopySubresourceRegion(staging_, 0, 0, 0, 0, frameTexture, 0, &srcBox);
+        SafeRelease(frameTexture);
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = context_->Map(staging_, 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            const std::uint8_t* src = static_cast<const std::uint8_t*>(mapped.pData);
+            const std::size_t rowBytes = static_cast<std::size_t>(width_) * 4u;
+            for (int row = 0; row < height_; ++row) {
+                std::memcpy(
+                    bgra_.data() + static_cast<std::size_t>(row) * rowBytes,
+                    src + static_cast<std::size_t>(row) * mapped.RowPitch,
+                    rowBytes);
+            }
+            context_->Unmap(staging_, 0);
+        }
+
+        duplication_->ReleaseFrame();
+        return SUCCEEDED(hr);
     }
 
     const std::uint8_t* data() const {
-        return static_cast<const std::uint8_t*>(bits_);
+        return bgra_.data();
     }
 
     int width() const {
@@ -254,38 +397,49 @@ public:
 
 private:
     void reset() {
-        if (memDc_ && oldBitmap_) {
-            SelectObject(memDc_, oldBitmap_);
-            oldBitmap_ = nullptr;
-        }
-        if (dib_) {
-            DeleteObject(dib_);
-            dib_ = nullptr;
-        }
-        if (memDc_) {
-            DeleteDC(memDc_);
-            memDc_ = nullptr;
-        }
-        if (screenDc_) {
-            ReleaseDC(nullptr, screenDc_);
-            screenDc_ = nullptr;
-        }
-        bits_ = nullptr;
+        SafeRelease(staging_);
+        SafeRelease(duplication_);
+        SafeRelease(context_);
+        SafeRelease(device_);
+        bgra_.clear();
         width_ = 0;
         height_ = 0;
+        outputLeft_ = 0;
+        outputTop_ = 0;
+        outputWidth_ = 0;
+        outputHeight_ = 0;
     }
 
-    HDC screenDc_ = nullptr;
-    HDC memDc_ = nullptr;
-    HBITMAP dib_ = nullptr;
-    HBITMAP oldBitmap_ = nullptr;
-    void* bits_ = nullptr;
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    IDXGIOutputDuplication* duplication_ = nullptr;
+    ID3D11Texture2D* staging_ = nullptr;
+    std::vector<std::uint8_t> bgra_;
     int width_ = 0;
     int height_ = 0;
+    int outputLeft_ = 0;
+    int outputTop_ = 0;
+    int outputWidth_ = 0;
+    int outputHeight_ = 0;
 };
 
-int ClampInt(int value, int lo, int hi) {
-    return std::max(lo, std::min(value, hi));
+int SampleBellCurveMs(std::mt19937& rng, int minMs, int maxMs) {
+    if (maxMs <= minMs) {
+        return minMs;
+    }
+
+    const double mean = (static_cast<double>(minMs) + static_cast<double>(maxMs)) / 2.0;
+    const double stddev = static_cast<double>(maxMs - minMs) / 6.0;
+    std::normal_distribution<double> dist(mean, stddev);
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const int sample = static_cast<int>(dist(rng) + 0.5);
+        if (sample >= minMs && sample <= maxMs) {
+            return sample;
+        }
+    }
+
+    return ClampInt(static_cast<int>(dist(rng) + 0.5), minMs, maxMs);
 }
 
 bool MatchTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance) {
@@ -312,7 +466,7 @@ struct DetectionResult {
     int closestDelta = std::numeric_limits<int>::max();
 };
 
-DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance) {
+DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance, int minColorPixels) {
     DetectionResult result{};
 
     for (std::size_t i = 0; i < pixels; ++i) {
@@ -333,12 +487,12 @@ DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels
 
             if (dr <= tolerance && dg <= tolerance && db <= tolerance) {
                 ++result.hits;
-                result.detected = true;
                 break;
             }
         }
     }
 
+    result.detected = result.hits >= minColorPixels;
     return result;
 }
 
@@ -507,6 +661,8 @@ void WorkerMain() {
     bool keyHeld = false;
     DWORD heldKey = 0;
     RuntimeConfig heldConfig;
+    bool releasePending = false;
+    auto releaseAt = std::chrono::steady_clock::now();
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
@@ -515,6 +671,7 @@ void WorkerMain() {
                 keyHeld = false;
                 heldKey = 0;
             }
+            releasePending = false;
             Sleep(10);
             continue;
         }
@@ -528,6 +685,7 @@ void WorkerMain() {
         cfg.captureWidth = ClampInt(cfg.captureWidth, 1, 512);
         cfg.captureHeight = ClampInt(cfg.captureHeight, 1, 512);
         cfg.tolerance = ClampInt(cfg.tolerance, 0, 255);
+        cfg.minColorPixels = ClampInt(cfg.minColorPixels, 1, cfg.captureWidth * cfg.captureHeight);
 
         if (!capture.ensure(cfg.captureWidth, cfg.captureHeight)) {
             PostStatus(StatusKind::Disarmed);
@@ -550,9 +708,11 @@ void WorkerMain() {
             const DetectionResult detection = AnalyzeTargetColors(
                 capture.data(),
                 static_cast<std::size_t>(capture.width()) * static_cast<std::size_t>(capture.height()),
-                cfg.tolerance);
+                cfg.tolerance,
+                cfg.minColorPixels);
 
             g_app.lastHits.store(detection.hits, std::memory_order_relaxed);
+            g_app.requiredHits.store(cfg.minColorPixels, std::memory_order_relaxed);
             g_app.closestR.store(detection.closest.r, std::memory_order_relaxed);
             g_app.closestG.store(detection.closest.g, std::memory_order_relaxed);
             g_app.closestB.store(detection.closest.b, std::memory_order_relaxed);
@@ -565,16 +725,20 @@ void WorkerMain() {
             if (cfg.holdWhileVisible) {
                 if (detection.detected) {
                     PostStatus(StatusKind::Detected);
+                    releasePending = false;
 
                     if (keyHeld && heldKey != cfg.targetKey) {
                         output.up(heldConfig, heldKey);
                         keyHeld = false;
                         heldKey = 0;
+                        releasePending = false;
                     }
 
                     if (!keyHeld) {
-                        std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
-                        InterruptibleSleepMs(preDist(rng), g_app.armed, g_app.shuttingDown);
+                        InterruptibleSleepMs(
+                            SampleBellCurveMs(rng, cfg.delayBeforePressMin, cfg.delayBeforePressMax),
+                            g_app.armed,
+                            g_app.shuttingDown);
 
                         if (g_app.armed.load(std::memory_order_relaxed) &&
                             !g_app.shuttingDown.load(std::memory_order_relaxed) &&
@@ -586,9 +750,18 @@ void WorkerMain() {
                     }
                 } else {
                     if (keyHeld) {
-                        output.up(heldConfig, heldKey);
-                        keyHeld = false;
-                        heldKey = 0;
+                        if (!releasePending) {
+                            std::uniform_int_distribution<int> releaseDist(cfg.releaseDelayMin, cfg.releaseDelayMax);
+                            releaseAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(releaseDist(rng));
+                            releasePending = true;
+                        }
+
+                        if (std::chrono::steady_clock::now() >= releaseAt) {
+                            output.up(heldConfig, heldKey);
+                            keyHeld = false;
+                            heldKey = 0;
+                            releasePending = false;
+                        }
                     }
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 }
@@ -597,14 +770,17 @@ void WorkerMain() {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
                     heldKey = 0;
+                    releasePending = false;
                 }
 
                 PostStatus(StatusKind::Detected);
 
-                std::uniform_int_distribution<int> preDist(cfg.delayBeforePressMin, cfg.delayBeforePressMax);
                 std::uniform_int_distribution<int> holdDist(cfg.keyHoldMin, cfg.keyHoldMax);
 
-                InterruptibleSleepMs(preDist(rng), g_app.armed, g_app.shuttingDown);
+                InterruptibleSleepMs(
+                    SampleBellCurveMs(rng, cfg.delayBeforePressMin, cfg.delayBeforePressMax),
+                    g_app.armed,
+                    g_app.shuttingDown);
 
                 if (g_app.armed.load(std::memory_order_relaxed) &&
                     !g_app.shuttingDown.load(std::memory_order_relaxed)) {
@@ -789,11 +965,14 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     if (!ParseIntControl(hwnd, IDC_WIDTH, next.captureWidth) ||
         !ParseIntControl(hwnd, IDC_HEIGHT, next.captureHeight) ||
         !ParseIntControl(hwnd, IDC_TOLERANCE, next.tolerance) ||
+        !ParseIntControl(hwnd, IDC_MIN_COLOR_PIXELS, next.minColorPixels) ||
         !ParseVirtualKeyControl(hwnd, IDC_KEY, next.targetKey) ||
         !ParseIntControl(hwnd, IDC_PRE_MIN, next.delayBeforePressMin) ||
         !ParseIntControl(hwnd, IDC_PRE_MAX, next.delayBeforePressMax) ||
         !ParseIntControl(hwnd, IDC_HOLD_MIN, next.keyHoldMin) ||
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
+        !ParseIntControl(hwnd, IDC_RELEASE_MIN, next.releaseDelayMin) ||
+        !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
         !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs) ||
         !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
         error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, or F6.";
@@ -809,8 +988,13 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         error = L"Tolerance must be between 0 and 255 RGB levels.";
         return false;
     }
+    if (next.minColorPixels < 1 || next.minColorPixels > next.captureWidth * next.captureHeight) {
+        error = L"Required color pixels must be between 1 and the capture area's total pixels.";
+        return false;
+    }
     if (next.delayBeforePressMin < 0 || next.delayBeforePressMax < next.delayBeforePressMin ||
-        next.keyHoldMin < 0 || next.keyHoldMax < next.keyHoldMin) {
+        next.keyHoldMin < 0 || next.keyHoldMax < next.keyHoldMin ||
+        next.releaseDelayMin < 0 || next.releaseDelayMax < next.releaseDelayMin) {
         error = L"Each timing range must be non-negative and min <= max.";
         return false;
     }
@@ -844,16 +1028,35 @@ HWND CreateEdit(HWND parent, int id, int x, int y, int w, int h) {
         x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
 }
 
+HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
+    return CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL,
+        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+}
+
+void PopulateHitThresholdChoices(HWND combo) {
+    const int choices[] = {1, 2, 3, 5, 10, 15, 25, 50, 100, 250, 500};
+    for (int value : choices) {
+        wchar_t text[16]{};
+        wsprintfW(text, L"%d", value);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
+    }
+}
+
 void PopulateDefaults(HWND hwnd) {
     const RuntimeConfig cfg{};
     SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
     SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
     SetControlInt(hwnd, IDC_TOLERANCE, cfg.tolerance);
+    SetControlInt(hwnd, IDC_MIN_COLOR_PIXELS, cfg.minColorPixels);
     SetControlKeyName(hwnd, IDC_KEY, cfg.targetKey);
     SetControlInt(hwnd, IDC_PRE_MIN, cfg.delayBeforePressMin);
     SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
     SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
+    SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
+    SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
     SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
     SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
     SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
@@ -964,8 +1167,9 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"Tolerance", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOLERANCE, leftEditX, y - 3, editW, rowH);
     CreateLabel(hwnd, L"RGB", leftUnitX, y, 48, rowH);
-    CreateLabel(hwnd, L"Key to press", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"Required pixels", rightLabelX, y, labelW, rowH);
+    HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, rightEditX, y - 3, editW, 160);
+    PopulateHitThresholdChoices(minPixels);
 
     y += gap;
     CreateLabel(hwnd, L"Delay before key", leftLabelX, y, labelW, rowH);
@@ -973,6 +1177,8 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
     CreateEdit(hwnd, IDC_PRE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateLabel(hwnd, L"Key to press", rightLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 3, editW, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Key press length", leftLabelX, y, labelW, rowH);
@@ -986,6 +1192,13 @@ void CreateMainControls(HWND hwnd) {
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     leftLabelX, y - 2, 300, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_HOLD_WHILE_VISIBLE), GetModuleHandleW(nullptr), nullptr);
+
+    y += gap;
+    CreateLabel(hwnd, L"Release delay", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_RELEASE_MIN, leftEditX, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
+    CreateEdit(hwnd, IDC_RELEASE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Capture interval", leftLabelX, y, labelW, rowH);
@@ -1125,8 +1338,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t text[128]{};
         wsprintfW(
             text,
-            L"Hits: %d  Closest RGB: %d,%d,%d  +/- %d",
+            L"Hits: %d/%d  Closest RGB: %d,%d,%d  +/- %d",
             g_app.lastHits.load(std::memory_order_relaxed),
+            g_app.requiredHits.load(std::memory_order_relaxed),
             g_app.closestR.load(std::memory_order_relaxed),
             g_app.closestG.load(std::memory_order_relaxed),
             g_app.closestB.load(std::memory_order_relaxed),
