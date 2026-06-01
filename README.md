@@ -5,9 +5,9 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 ## What it does
 
 - Captures a small zone centered on the virtual desktop through DXGI Desktop Duplication.
-- Detects configured RGB target colors with per-channel tolerance and a configurable required pixel count.
+- Detects a color-picker-selected RGB target color with per-channel tolerance and a configurable required pixel count.
 - Sends configurable key down/up commands only to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
-- Provides runtime controls for capture size, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
+- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
 - Shows a live zoomed preview of the monitored area.
 
 ## External Arduino input
@@ -28,14 +28,14 @@ From a Visual Studio Developer Command Prompt:
 
 ```bat
 rc minhanbot.rc
-cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comdlg32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 ```
 
 Cross-compile from macOS/Linux with MinGW-w64:
 
 ```sh
 x86_64-w64-mingw32-windres minhanbot.rc -O coff -o minhanbot.res
-x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ minhanbot.cpp minhanbot.res -o minhanbot.exe -luser32 -lgdi32 -ld3d11 -ldxgi
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ minhanbot.cpp minhanbot.res -o minhanbot.exe -luser32 -lgdi32 -lcomdlg32 -ld3d11 -ldxgi
 ```
 
 ## Files

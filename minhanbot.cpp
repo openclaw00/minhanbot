@@ -3,12 +3,12 @@
 
     Build from a "Developer Command Prompt for VS":
         rc minhanbot.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comdlg32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
         - Runtime values can be edited in the GUI before pressing Start.
-        - Target colors are compile-time constants in TARGET_COLORS.
+        - Target color can be changed with the GUI color picker.
 
     What it does:
         - Captures a small zone centered on the virtual desktop.
@@ -33,6 +33,7 @@
 #endif
 
 #include <windows.h>
+#include <commdlg.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
@@ -57,19 +58,14 @@ constexpr int CAPTURE_HEIGHT = 25;
 constexpr int COLOR_TOLERANCE = 40;
 constexpr int MIN_COLOR_PIXELS = 1;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
+constexpr int TARGET_COLOR_R = 222;
+constexpr int TARGET_COLOR_G = 132;
+constexpr int TARGET_COLOR_B = 255;
 
 struct RGB_COLOR {
     int r;
     int g;
     int b;
-};
-
-// Target colors to detect.
-const RGB_COLOR TARGET_COLORS[] = {
-    {222, 132, 255},
-    {238, 143, 211},
-    {253, 118, 255},
-    {255, 150, 235}
 };
 
 // Humanization / cadence jitter timing (milliseconds).
@@ -113,6 +109,8 @@ constexpr int IDC_TOGGLE_HOTKEY = 1017;
 constexpr int IDC_SERIAL_PORT = 1019;
 constexpr int IDC_MIN_COLOR_PIXELS = 1020;
 constexpr int IDC_SCAN_MAX = 1021;
+constexpr int IDC_PICK_COLOR = 1022;
+constexpr int IDC_TARGET_COLOR = 1023;
 
 enum class StatusKind : int {
     Disarmed,
@@ -125,6 +123,7 @@ struct RuntimeConfig {
     int captureHeight = CAPTURE_HEIGHT;
     int tolerance = COLOR_TOLERANCE;
     int minColorPixels = MIN_COLOR_PIXELS;
+    RGB_COLOR targetColor{TARGET_COLOR_R, TARGET_COLOR_G, TARGET_COLOR_B};
     DWORD targetKey = TARGET_KEY;
     int delayBeforePressMin = DELAY_BEFORE_PRESS_MIN;
     int delayBeforePressMax = DELAY_BEFORE_PRESS_MAX;
@@ -153,6 +152,7 @@ struct AppState {
     HWND stop = nullptr;
     HWND apply = nullptr;
     HWND stats = nullptr;
+    HWND targetColorText = nullptr;
     DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
@@ -167,6 +167,7 @@ struct AppState {
 
     std::mutex configMutex;
     RuntimeConfig config;
+    RGB_COLOR selectedTargetColor{TARGET_COLOR_R, TARGET_COLOR_G, TARGET_COLOR_B};
 
     std::mutex frameMutex;
     FrameBuffer latestFrame;
@@ -437,23 +438,6 @@ int SampleBellCurveMs(std::mt19937& rng, int minMs, int maxMs) {
     return ClampInt(static_cast<int>(dist(rng) + 0.5), minMs, maxMs);
 }
 
-bool MatchTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance) {
-    for (std::size_t i = 0; i < pixels; ++i) {
-        const std::uint8_t b = bgra[i * 4 + 0];
-        const std::uint8_t g = bgra[i * 4 + 1];
-        const std::uint8_t r = bgra[i * 4 + 2];
-
-        for (const RGB_COLOR& target : TARGET_COLORS) {
-            if (std::abs(static_cast<int>(r) - target.r) <= tolerance &&
-                std::abs(static_cast<int>(g) - target.g) <= tolerance &&
-                std::abs(static_cast<int>(b) - target.b) <= tolerance) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 struct DetectionResult {
     bool detected = false;
     int hits = 0;
@@ -461,7 +445,12 @@ struct DetectionResult {
     int closestDelta = std::numeric_limits<int>::max();
 };
 
-DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels, int tolerance, int minColorPixels) {
+DetectionResult AnalyzeTargetColors(
+    const std::uint8_t* bgra,
+    std::size_t pixels,
+    const RGB_COLOR& target,
+    int tolerance,
+    int minColorPixels) {
     DetectionResult result{};
 
     for (std::size_t i = 0; i < pixels; ++i) {
@@ -469,21 +458,18 @@ DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels
         const std::uint8_t g = bgra[i * 4 + 1];
         const std::uint8_t r = bgra[i * 4 + 2];
 
-        for (const RGB_COLOR& target : TARGET_COLORS) {
-            const int dr = std::abs(static_cast<int>(r) - target.r);
-            const int dg = std::abs(static_cast<int>(g) - target.g);
-            const int db = std::abs(static_cast<int>(b) - target.b);
-            const int maxDelta = std::max({dr, dg, db});
+        const int dr = std::abs(static_cast<int>(r) - target.r);
+        const int dg = std::abs(static_cast<int>(g) - target.g);
+        const int db = std::abs(static_cast<int>(b) - target.b);
+        const int maxDelta = std::max({dr, dg, db});
 
-            if (maxDelta < result.closestDelta) {
-                result.closestDelta = maxDelta;
-                result.closest = {static_cast<int>(r), static_cast<int>(g), static_cast<int>(b)};
-            }
+        if (maxDelta < result.closestDelta) {
+            result.closestDelta = maxDelta;
+            result.closest = {static_cast<int>(r), static_cast<int>(g), static_cast<int>(b)};
+        }
 
-            if (dr <= tolerance && dg <= tolerance && db <= tolerance) {
-                ++result.hits;
-                break;
-            }
+        if (dr <= tolerance && dg <= tolerance && db <= tolerance) {
+            ++result.hits;
         }
     }
 
@@ -681,6 +667,7 @@ void WorkerMain() {
             const DetectionResult detection = AnalyzeTargetColors(
                 capture.data(),
                 static_cast<std::size_t>(capture.width()) * static_cast<std::size_t>(capture.height()),
+                cfg.targetColor,
                 cfg.tolerance,
                 cfg.minColorPixels);
 
@@ -875,6 +862,12 @@ void SetControlInt(HWND parent, int id, int value) {
     SetWindowTextW(GetDlgItem(parent, id), buf);
 }
 
+void SetTargetColorText(HWND hwnd, const RGB_COLOR& color) {
+    wchar_t text[64]{};
+    wsprintfW(text, L"RGB: %d,%d,%d", color.r, color.g, color.b);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_TARGET_COLOR), text);
+}
+
 std::wstring VirtualKeyDisplayName(DWORD vk) {
     if (vk >= L'A' && vk <= L'Z') {
         return std::wstring(1, static_cast<wchar_t>(vk));
@@ -978,6 +971,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         return false;
     }
 
+    next.targetColor = g_app.selectedTargetColor;
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
@@ -1030,6 +1024,8 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
     SetControlInt(hwnd, IDC_TOLERANCE, cfg.tolerance);
     SetControlInt(hwnd, IDC_MIN_COLOR_PIXELS, cfg.minColorPixels);
+    g_app.selectedTargetColor = cfg.targetColor;
+    SetTargetColorText(hwnd, cfg.targetColor);
     SetControlKeyName(hwnd, IDC_KEY, cfg.targetKey);
     SetControlInt(hwnd, IDC_PRE_MIN, cfg.delayBeforePressMin);
     SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
@@ -1137,6 +1133,17 @@ void CreateMainControls(HWND hwnd) {
     PopulateHitThresholdChoices(minPixels);
 
     y += gap;
+    CreateLabel(hwnd, L"Target color", leftLabelX, y, labelW, rowH);
+    CreateWindowExW(0, L"BUTTON", L"Pick color",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                    leftEditX, y - 3, editW, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_PICK_COLOR), GetModuleHandleW(nullptr), nullptr);
+    g_app.targetColorText = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+                                            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                            leftEditX + 108, y - 3, 150, rowH,
+                                            hwnd, reinterpret_cast<HMENU>(IDC_TARGET_COLOR), GetModuleHandleW(nullptr), nullptr);
+
+    y += gap;
     CreateLabel(hwnd, L"Delay before key", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_PRE_MIN, leftEditX, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
@@ -1190,6 +1197,36 @@ void CreateMainControls(HWND hwnd) {
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
+}
+
+void PickTargetColor(HWND hwnd) {
+    static COLORREF customColors[16]{};
+
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hwnd;
+    cc.lpCustColors = customColors;
+    cc.rgbResult = RGB(
+        ClampInt(g_app.selectedTargetColor.r, 0, 255),
+        ClampInt(g_app.selectedTargetColor.g, 0, 255),
+        ClampInt(g_app.selectedTargetColor.b, 0, 255));
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    if (!ChooseColorW(&cc)) {
+        return;
+    }
+
+    g_app.selectedTargetColor = {
+        static_cast<int>(GetRValue(cc.rgbResult)),
+        static_cast<int>(GetGValue(cc.rgbResult)),
+        static_cast<int>(GetBValue(cc.rgbResult))
+    };
+    SetTargetColorText(hwnd, g_app.selectedTargetColor);
+
+    {
+        std::lock_guard<std::mutex> lock(g_app.configMutex);
+        g_app.config.targetColor = g_app.selectedTargetColor;
+    }
 }
 
 bool ApplyConfig(HWND hwnd) {
@@ -1265,6 +1302,9 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_APPLY:
             ApplyConfig(hwnd);
+            return 0;
+        case IDC_PICK_COLOR:
+            PickTargetColor(hwnd);
             return 0;
         default:
             break;
@@ -1366,7 +1406,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        990, 360,
+        990, 390,
         nullptr,
         nullptr,
         hInstance,
