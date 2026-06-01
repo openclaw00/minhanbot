@@ -3,12 +3,12 @@
 
     Build from a "Developer Command Prompt for VS":
         rc minhanbot.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comdlg32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
         - Runtime values can be edited in the GUI before pressing Start.
-        - Target color can be changed with the GUI color picker.
+        - Target color can be sampled from the screen with the GUI picker.
 
     What it does:
         - Captures a small zone centered on the virtual desktop.
@@ -33,7 +33,6 @@
 #endif
 
 #include <windows.h>
-#include <commdlg.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
@@ -86,6 +85,7 @@ constexpr int SCAN_INTERVAL_MAX = 13;
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
 constexpr UINT WM_APP_STATS = WM_APP + 3;
+constexpr UINT WM_APP_PICKED_COLOR = WM_APP + 4;
 constexpr int TOGGLE_HOTKEY_ID = 1;
 
 // Control identifiers.
@@ -157,6 +157,7 @@ struct AppState {
 
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
+    std::atomic_bool colorPickActive{false};
     std::atomic_int lastHits{0};
     std::atomic_int requiredHits{MIN_COLOR_PIXELS};
     std::atomic_int closestR{0};
@@ -1134,7 +1135,7 @@ void CreateMainControls(HWND hwnd) {
 
     y += gap;
     CreateLabel(hwnd, L"Target color", leftLabelX, y, labelW, rowH);
-    CreateWindowExW(0, L"BUTTON", L"Pick color",
+    CreateWindowExW(0, L"BUTTON", L"Pick screen",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                     leftEditX, y - 3, editW, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_PICK_COLOR), GetModuleHandleW(nullptr), nullptr);
@@ -1199,27 +1200,11 @@ void CreateMainControls(HWND hwnd) {
     EnableWindow(g_app.stop, FALSE);
 }
 
-void PickTargetColor(HWND hwnd) {
-    static COLORREF customColors[16]{};
-
-    CHOOSECOLORW cc{};
-    cc.lStructSize = sizeof(cc);
-    cc.hwndOwner = hwnd;
-    cc.lpCustColors = customColors;
-    cc.rgbResult = RGB(
-        ClampInt(g_app.selectedTargetColor.r, 0, 255),
-        ClampInt(g_app.selectedTargetColor.g, 0, 255),
-        ClampInt(g_app.selectedTargetColor.b, 0, 255));
-    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-
-    if (!ChooseColorW(&cc)) {
-        return;
-    }
-
+void SetSelectedTargetColor(HWND hwnd, COLORREF color) {
     g_app.selectedTargetColor = {
-        static_cast<int>(GetRValue(cc.rgbResult)),
-        static_cast<int>(GetGValue(cc.rgbResult)),
-        static_cast<int>(GetBValue(cc.rgbResult))
+        static_cast<int>(GetRValue(color)),
+        static_cast<int>(GetGValue(color)),
+        static_cast<int>(GetBValue(color))
     };
     SetTargetColorText(hwnd, g_app.selectedTargetColor);
 
@@ -1227,6 +1212,46 @@ void PickTargetColor(HWND hwnd) {
         std::lock_guard<std::mutex> lock(g_app.configMutex);
         g_app.config.targetColor = g_app.selectedTargetColor;
     }
+}
+
+void StartScreenColorPick(HWND hwnd) {
+    if (g_app.colorPickActive.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    SetWindowTextW(GetDlgItem(hwnd, IDC_PICK_COLOR), L"Click screen...");
+
+    std::thread([hwnd]() {
+        while (!g_app.shuttingDown.load(std::memory_order_relaxed) &&
+               (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+            Sleep(10);
+        }
+
+        while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
+            if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) {
+                break;
+            }
+
+            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+                POINT pt{};
+                COLORREF color = CLR_INVALID;
+                if (GetCursorPos(&pt)) {
+                    HDC hdc = GetDC(nullptr);
+                    if (hdc) {
+                        color = GetPixel(hdc, pt.x, pt.y);
+                        ReleaseDC(nullptr, hdc);
+                    }
+                }
+
+                PostMessageW(hwnd, WM_APP_PICKED_COLOR, static_cast<WPARAM>(color), 0);
+                return;
+            }
+
+            Sleep(10);
+        }
+
+        PostMessageW(hwnd, WM_APP_PICKED_COLOR, static_cast<WPARAM>(CLR_INVALID), 0);
+    }).detach();
 }
 
 bool ApplyConfig(HWND hwnd) {
@@ -1304,7 +1329,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ApplyConfig(hwnd);
             return 0;
         case IDC_PICK_COLOR:
-            PickTargetColor(hwnd);
+            StartScreenColorPick(hwnd);
             return 0;
         default:
             break;
@@ -1354,6 +1379,14 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+
+    case WM_APP_PICKED_COLOR:
+        g_app.colorPickActive.store(false, std::memory_order_relaxed);
+        SetWindowTextW(GetDlgItem(hwnd, IDC_PICK_COLOR), L"Pick screen");
+        if (static_cast<COLORREF>(wParam) != CLR_INVALID) {
+            SetSelectedTargetColor(hwnd, static_cast<COLORREF>(wParam));
+        }
+        return 0;
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
