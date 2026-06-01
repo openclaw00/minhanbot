@@ -6,12 +6,11 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 
 - Captures a small zone centered on the virtual desktop through DXGI Desktop Duplication.
 - Detects configured RGB target colors with per-channel tolerance and a configurable required pixel count.
-- Sends a configurable keyboard press/release using `SendInput`.
-- Optionally sends key down/up commands to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
-- Provides runtime controls for capture size, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, hold-while-visible mode, release delay, capture interval, and a Start/Stop hotkey.
+- Sends configurable key down/up commands only to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
+- Provides runtime controls for capture size, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
 - Shows a live zoomed preview of the monitored area.
 
-## External USB HID input
+## External Arduino input
 
 Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board that supports the Arduino `Keyboard` library.
 
@@ -19,7 +18,7 @@ Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board t
 2. Select the board and upload the sketch.
 3. Plug the board into the Windows machine running `minhanbot.exe`.
 4. Check Device Manager for the board's COM port, for example `COM4`.
-5. In minhanbot, check `External USB HID`, choose or type the COM port, then press `Apply`.
+5. In minhanbot, choose or type the COM port, then press `Apply`.
 
 The desktop app still does detection and timing. The board receives commands such as `D 4A` and `U 4A`, then performs the actual USB keyboard press/release.
 

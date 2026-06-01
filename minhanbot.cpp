@@ -15,11 +15,11 @@
         - Checks every captured pixel against the target RGB colors with a per-channel tolerance.
         - Requires a configurable number of matching color pixels before triggering.
         - When a match is found, either taps the configured key or holds it until the color disappears.
-        - Uses randomized pre-press and key-hold timing to avoid rigid machine-like cadence.
-        - Runs capture/input on a background worker thread; the GUI remains responsive.
+        - Uses randomized pre-press, key-hold, release, and scan timing to avoid rigid cadence.
+        - Runs capture/serial-command output on a background worker thread; the GUI remains responsive.
 
     Notes:
-        - This is keyboard-only input injection via SendInput().
+        - Key commands are sent only to an external serial USB HID bridge.
         - Compile as a Windows subsystem application; no console window is used.
         - DXGI Desktop Duplication is used to capture the output containing the center of the
           virtual desktop, then a small centered region is copied into a CPU-readable texture.
@@ -82,8 +82,9 @@ constexpr int RELEASE_DELAY_MAX = 100;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
 constexpr int IDI_APP_ICON = 1;
 
-// Capture loop pacing. Use 0 for max-speed polling, but 10ms is a balanced default.
-constexpr int CAPTURE_INTERVAL_MS = 10;
+// Capture loop pacing. Use 0 for max-speed polling.
+constexpr int SCAN_INTERVAL_MIN = 7;
+constexpr int SCAN_INTERVAL_MAX = 13;
 
 // GUI messages.
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
@@ -105,23 +106,18 @@ constexpr int IDC_HOLD_MIN = 1010;
 constexpr int IDC_HOLD_MAX = 1011;
 constexpr int IDC_RELEASE_MIN = 1012;
 constexpr int IDC_RELEASE_MAX = 1013;
-constexpr int IDC_INTERVAL = 1014;
+constexpr int IDC_SCAN_MIN = 1014;
 constexpr int IDC_APPLY = 1015;
 constexpr int IDC_HOLD_WHILE_VISIBLE = 1016;
 constexpr int IDC_TOGGLE_HOTKEY = 1017;
-constexpr int IDC_EXTERNAL_HID = 1018;
 constexpr int IDC_SERIAL_PORT = 1019;
 constexpr int IDC_MIN_COLOR_PIXELS = 1020;
+constexpr int IDC_SCAN_MAX = 1021;
 
 enum class StatusKind : int {
     Disarmed,
     Armed,
     Detected
-};
-
-enum class InputBackend : int {
-    SendInput,
-    SerialHid
 };
 
 struct RuntimeConfig {
@@ -136,10 +132,10 @@ struct RuntimeConfig {
     int keyHoldMax = KEY_HOLD_MAX;
     int releaseDelayMin = RELEASE_DELAY_MIN;
     int releaseDelayMax = RELEASE_DELAY_MAX;
-    int captureIntervalMs = CAPTURE_INTERVAL_MS;
+    int scanIntervalMin = SCAN_INTERVAL_MIN;
+    int scanIntervalMax = SCAN_INTERVAL_MAX;
     bool holdWhileVisible = true;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
-    InputBackend inputBackend = InputBackend::SendInput;
     std::wstring serialPort = L"COM4";
 };
 
@@ -495,21 +491,6 @@ DetectionResult AnalyzeTargetColors(const std::uint8_t* bgra, std::size_t pixels
     return result;
 }
 
-bool SendInputKeyDown(DWORD vk) {
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = static_cast<WORD>(vk);
-    return SendInput(1, &input, sizeof(INPUT)) == 1;
-}
-
-void SendInputKeyUp(DWORD vk) {
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = static_cast<WORD>(vk);
-    input.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &input, sizeof(INPUT));
-}
-
 class SerialHidBridge {
 public:
     SerialHidBridge() = default;
@@ -604,18 +585,11 @@ private:
 class KeyOutput {
 public:
     bool down(const RuntimeConfig& cfg, DWORD vk) {
-        if (cfg.inputBackend == InputBackend::SerialHid) {
-            return serial_.send(true, vk, cfg.serialPort);
-        }
-        return SendInputKeyDown(vk);
+        return serial_.send(true, vk, cfg.serialPort);
     }
 
     void up(const RuntimeConfig& cfg, DWORD vk) {
-        if (cfg.inputBackend == InputBackend::SerialHid) {
-            serial_.send(false, vk, cfg.serialPort);
-            return;
-        }
-        SendInputKeyUp(vk);
+        serial_.send(false, vk, cfg.serialPort);
     }
 
     bool press(const RuntimeConfig& cfg, DWORD vk, int holdMs, const std::atomic_bool& armed) {
@@ -794,8 +768,9 @@ void WorkerMain() {
             }
         }
 
-        if (cfg.captureIntervalMs > 0) {
-            InterruptibleSleepMs(cfg.captureIntervalMs, g_app.armed, g_app.shuttingDown);
+        const int scanIntervalMs = SampleBellCurveMs(rng, cfg.scanIntervalMin, cfg.scanIntervalMax);
+        if (scanIntervalMs > 0) {
+            InterruptibleSleepMs(scanIntervalMs, g_app.armed, g_app.shuttingDown);
         } else {
             std::this_thread::yield();
         }
@@ -972,7 +947,8 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MIN, next.releaseDelayMin) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
-        !ParseIntControl(hwnd, IDC_INTERVAL, next.captureIntervalMs) ||
+        !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
+        !ParseIntControl(hwnd, IDC_SCAN_MAX, next.scanIntervalMax) ||
         !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
         error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, or F6.";
         return false;
@@ -997,18 +973,15 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         error = L"Each timing range must be non-negative and min <= max.";
         return false;
     }
-    if (next.captureIntervalMs < 0 || next.captureIntervalMs > 1000) {
-        error = L"Capture interval must be between 0 and 1000 ms.";
+    if (next.scanIntervalMin < 0 || next.scanIntervalMax < next.scanIntervalMin || next.scanIntervalMax > 1000) {
+        error = L"Scan interval range must be between 0 and 1000 ms with min <= max.";
         return false;
     }
 
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
-    next.inputBackend = IsDlgButtonChecked(hwnd, IDC_EXTERNAL_HID) == BST_CHECKED
-        ? InputBackend::SerialHid
-        : InputBackend::SendInput;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
-    if (next.inputBackend == InputBackend::SerialHid && !IsSerialPortNameValid(next.serialPort)) {
-        error = L"Serial HID mode needs a COM port like COM4.";
+    if (!IsSerialPortNameValid(next.serialPort)) {
+        error = L"External Arduino input needs a COM port like COM4.";
         return false;
     }
 
@@ -1064,11 +1037,11 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
     SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
     SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
-    SetControlInt(hwnd, IDC_INTERVAL, cfg.captureIntervalMs);
+    SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
+    SetControlInt(hwnd, IDC_SCAN_MAX, cfg.scanIntervalMax);
     SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
     SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(hwnd, IDC_EXTERNAL_HID, cfg.inputBackend == InputBackend::SerialHid ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void DrawPreview(HWND hwnd, HDC hdc) {
@@ -1193,20 +1166,18 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
 
     y += gap;
-    CreateLabel(hwnd, L"Capture interval", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_INTERVAL, leftEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
+    CreateLabel(hwnd, L"Scan interval", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_SCAN_MIN, leftEditX, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
+    CreateEdit(hwnd, IDC_SCAN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 3, editW, rowH);
 
-    CreateWindowExW(0, L"BUTTON", L"External USB HID",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    rightLabelX, y - 2, 160, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_EXTERNAL_HID), GetModuleHandleW(nullptr), nullptr);
-    CreateLabel(hwnd, L"Port", rightEditX, y, 34, rowH);
-    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX + 42, y - 3, 92, 180);
+    CreateLabel(hwnd, L"Arduino COM port", rightLabelX, y, labelW, rowH);
+    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 3, editW, 180);
     PopulateSerialPortChoices(serialPort);
 
     CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
