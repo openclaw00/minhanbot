@@ -112,6 +112,17 @@ constexpr int IDC_SCAN_MAX = 1021;
 constexpr int IDC_PICK_COLOR = 1022;
 constexpr int IDC_TARGET_COLOR = 1023;
 
+// Black-and-white dark UI theme.
+constexpr COLORREF THEME_BG = RGB(8, 8, 8);
+constexpr COLORREF THEME_PANEL = RGB(18, 18, 18);
+constexpr COLORREF THEME_FIELD = RGB(12, 12, 12);
+constexpr COLORREF THEME_FIELD_ALT = RGB(28, 28, 28);
+constexpr COLORREF THEME_BORDER = RGB(82, 82, 82);
+constexpr COLORREF THEME_BORDER_HOT = RGB(170, 170, 170);
+constexpr COLORREF THEME_TEXT = RGB(245, 245, 245);
+constexpr COLORREF THEME_MUTED = RGB(178, 178, 178);
+constexpr COLORREF THEME_DISABLED = RGB(94, 94, 94);
+
 enum class StatusKind : int {
     Disarmed,
     Armed,
@@ -175,6 +186,26 @@ struct AppState {
 };
 
 AppState g_app;
+
+HBRUSH ThemeBackgroundBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_BG);
+    return brush;
+}
+
+HBRUSH ThemePanelBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_PANEL);
+    return brush;
+}
+
+HBRUSH ThemeFieldBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_FIELD);
+    return brush;
+}
+
+HBRUSH ThemeListBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_FIELD_ALT);
+    return brush;
+}
 
 template <typename T>
 void SafeRelease(T*& ptr) {
@@ -988,6 +1019,13 @@ void CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
     CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
 
+HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
+    return CreateWindowExW(
+        0, L"BUTTON", text,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+}
+
 HWND CreateEdit(HWND parent, int id, int x, int y, int w, int h) {
     return CreateWindowExW(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1017,6 +1055,59 @@ void PopulateSerialPortChoices(HWND combo) {
         wsprintfW(text, L"COM%d", port);
         SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
     }
+}
+
+void DrawButtonControl(const DRAWITEMSTRUCT& item) {
+    HDC hdc = item.hDC;
+    RECT rc = item.rcItem;
+    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const bool focused = (item.itemState & ODS_FOCUS) != 0;
+
+    HBRUSH fill = CreateSolidBrush(disabled ? RGB(20, 20, 20) : (pressed ? RGB(36, 36, 36) : THEME_PANEL));
+    FillRect(hdc, &rc, fill);
+    DeleteObject(fill);
+
+    HPEN border = CreatePen(PS_SOLID, 1, focused ? THEME_BORDER_HOT : THEME_BORDER);
+    HGDIOBJ oldPen = SelectObject(hdc, border);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(border);
+
+    wchar_t text[128]{};
+    GetWindowTextW(item.hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, disabled ? THEME_DISABLED : THEME_TEXT);
+    if (pressed) {
+        OffsetRect(&rc, 1, 1);
+    }
+    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void ApplyCtlColor(HDC hdc, COLORREF bg, COLORREF fg = THEME_TEXT) {
+    SetTextColor(hdc, fg);
+    SetBkColor(hdc, bg);
+}
+
+void EnableDarkTitleBar(HWND hwnd) {
+    HMODULE dwmapi = LoadLibraryW(L"dwmapi.dll");
+    if (!dwmapi) {
+        return;
+    }
+
+    using DwmSetWindowAttributeFn = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    auto setWindowAttribute = reinterpret_cast<DwmSetWindowAttributeFn>(
+        GetProcAddress(dwmapi, "DwmSetWindowAttribute"));
+    if (setWindowAttribute) {
+        const BOOL enabled = TRUE;
+        // Windows 10 1809+ uses 20; older builds used 19 for the same dark-title-bar flag.
+        setWindowAttribute(hwnd, 20, &enabled, sizeof(enabled));
+        setWindowAttribute(hwnd, 19, &enabled, sizeof(enabled));
+    }
+
+    FreeLibrary(dwmapi);
 }
 
 void PopulateDefaults(HWND hwnd) {
@@ -1093,12 +1184,9 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 
 void CreateMainControls(HWND hwnd) {
-    g_app.start = CreateWindowExW(0, L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  16, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_START), GetModuleHandleW(nullptr), nullptr);
-    g_app.stop = CreateWindowExW(0, L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                 112, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_STOP), GetModuleHandleW(nullptr), nullptr);
-    g_app.apply = CreateWindowExW(0, L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  208, 16, 86, 30, hwnd, reinterpret_cast<HMENU>(IDC_APPLY), GetModuleHandleW(nullptr), nullptr);
+    g_app.start = CreateButton(hwnd, IDC_START, L"Start", 16, 16, 86, 30);
+    g_app.stop = CreateButton(hwnd, IDC_STOP, L"Stop", 112, 16, 86, 30);
+    g_app.apply = CreateButton(hwnd, IDC_APPLY, L"Apply", 208, 16, 86, 30);
 
     CreateLabel(hwnd, L"Status", 360, 21, 60, 20);
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
@@ -1135,10 +1223,7 @@ void CreateMainControls(HWND hwnd) {
 
     y += gap;
     CreateLabel(hwnd, L"Target color", leftLabelX, y, labelW, rowH);
-    CreateWindowExW(0, L"BUTTON", L"Pick screen",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                    leftEditX, y - 3, editW, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_PICK_COLOR), GetModuleHandleW(nullptr), nullptr);
+    CreateButton(hwnd, IDC_PICK_COLOR, L"Pick screen", leftEditX, y - 3, editW, rowH);
     g_app.targetColorText = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
                                             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                             leftEditX + 108, y - 3, 150, rowH,
@@ -1312,10 +1397,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         g_app.hwnd = hwnd;
+        EnableDarkTitleBar(hwnd);
         CreateMainControls(hwnd);
         ApplyConfig(hwnd);
         g_app.worker = std::thread(WorkerMain);
         return 0;
+
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeBackgroundBrush());
+        return 1;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -1335,6 +1428,40 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         break;
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        HWND child = reinterpret_cast<HWND>(lParam);
+        const int id = GetDlgCtrlID(child);
+        if (id == IDC_STATUS || id == IDC_TARGET_COLOR) {
+            ApplyCtlColor(hdc, THEME_PANEL);
+            return reinterpret_cast<LRESULT>(ThemePanelBrush());
+        }
+        ApplyCtlColor(hdc, THEME_BG, THEME_MUTED);
+        return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        ApplyCtlColor(hdc, THEME_FIELD);
+        return reinterpret_cast<LRESULT>(ThemeFieldBrush());
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        ApplyCtlColor(hdc, THEME_FIELD_ALT);
+        return reinterpret_cast<LRESULT>(ThemeListBrush());
+    }
+
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        ApplyCtlColor(hdc, THEME_BG);
+        return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
+    }
+
+    case WM_DRAWITEM:
+        DrawButtonControl(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+        return TRUE;
 
     case WM_HOTKEY:
         if (static_cast<int>(wParam) == TOGGLE_HOTKEY_ID) {
@@ -1428,7 +1555,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
     mainClass.lpszClassName = L"minhanbotWindow";
-    mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    mainClass.hbrBackground = ThemeBackgroundBrush();
     if (!RegisterClassW(&mainClass)) {
         return 1;
     }
