@@ -14,7 +14,7 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 
 Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board that supports the Arduino `Keyboard` library.
 
-1. Open `firmware/serial-hid-bridge/serial-hid-bridge.ino` in the Arduino IDE.
+1. Open `firmware/serial_hid_bridge/serial_hid_bridge.ino` in the Arduino IDE.
 2. Select the board and upload the sketch.
 3. Plug the board into the Windows machine running `minhanbot.exe`.
 4. Check Device Manager for the board's COM port, for example `COM4`.
@@ -42,6 +42,6 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc
 
 - `minhanbot.cpp` - complete single-file Win32 source.
 - `minhanbot.rc` - Windows icon resource.
-- `firmware/serial-hid-bridge/serial-hid-bridge.ino` - optional external USB HID bridge firmware.
+- `firmware/serial_hid_bridge/serial_hid_bridge.ino` - optional external USB HID bridge firmware.
 - `assets/app-logo.png` and `assets/app.ico` - app logo and executable icon.
 - `minhanbot.exe` - Windows x64 GUI build.
