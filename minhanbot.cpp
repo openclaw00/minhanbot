@@ -766,6 +766,12 @@ void WorkerMain() {
                             heldConfig = cfg;
                         }
                     }
+                } else if (keyHeld && detection.detected && !heldInputActive) {
+                    output.up(heldConfig, heldKey);
+                    keyHeld = false;
+                    heldKey = 0;
+                    releasePending = false;
+                    PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 } else {
                     if (keyHeld) {
                         if (!releasePending) {
@@ -877,7 +883,7 @@ std::wstring TrimUpper(std::wstring value) {
     return result;
 }
 
-bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out) {
+bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out, bool allowMouseButtons = false) {
     const std::wstring value = TrimUpper(GetWindowTextString(GetDlgItem(parent, id)));
     if (value.empty()) {
         return false;
@@ -901,9 +907,6 @@ bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out) {
         {L"ENTER", VK_RETURN}, {L"RETURN", VK_RETURN}, {L"VK_RETURN", VK_RETURN},
         {L"TAB", VK_TAB}, {L"ESC", VK_ESCAPE}, {L"ESCAPE", VK_ESCAPE},
         {L"SHIFT", VK_SHIFT}, {L"CTRL", VK_CONTROL}, {L"CONTROL", VK_CONTROL}, {L"ALT", VK_MENU},
-        {L"LBUTTON", VK_LBUTTON}, {L"LEFTCLICK", VK_LBUTTON}, {L"LEFT_CLICK", VK_LBUTTON},
-        {L"RBUTTON", VK_RBUTTON}, {L"RIGHTCLICK", VK_RBUTTON}, {L"RIGHT_CLICK", VK_RBUTTON},
-        {L"MBUTTON", VK_MBUTTON}, {L"MIDDLECLICK", VK_MBUTTON}, {L"MIDDLE_CLICK", VK_MBUTTON},
         {L"LEFT", VK_LEFT}, {L"RIGHT", VK_RIGHT}, {L"UP", VK_UP}, {L"DOWN", VK_DOWN},
         {L"BACKSPACE", VK_BACK}, {L"DELETE", VK_DELETE}, {L"DEL", VK_DELETE},
         {L"HOME", VK_HOME}, {L"END", VK_END}, {L"PAGEUP", VK_PRIOR}, {L"PAGEDOWN", VK_NEXT},
@@ -916,6 +919,21 @@ bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out) {
         if (value == name.name) {
             out = name.vk;
             return true;
+        }
+    }
+
+    if (allowMouseButtons) {
+        static const KeyName mouseNames[] = {
+            {L"LBUTTON", VK_LBUTTON}, {L"LEFTCLICK", VK_LBUTTON}, {L"LEFT_CLICK", VK_LBUTTON},
+            {L"RBUTTON", VK_RBUTTON}, {L"RIGHTCLICK", VK_RBUTTON}, {L"RIGHT_CLICK", VK_RBUTTON},
+            {L"MBUTTON", VK_MBUTTON}, {L"MIDDLECLICK", VK_MBUTTON}, {L"MIDDLE_CLICK", VK_MBUTTON}
+        };
+
+        for (const KeyName& name : mouseNames) {
+            if (value == name.name) {
+                out = name.vk;
+                return true;
+            }
         }
     }
 
@@ -1020,9 +1038,9 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
         !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
         !ParseIntControl(hwnd, IDC_SCAN_MAX, next.scanIntervalMax) ||
-        !ParseVirtualKeyControl(hwnd, IDC_HELD_INPUT_KEY, next.heldInputKey) ||
+        !ParseVirtualKeyControl(hwnd, IDC_HELD_INPUT_KEY, next.heldInputKey, true) ||
         !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
-        error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, F6, or RBUTTON.";
+        error = L"One or more fields are invalid. Key to press accepts keyboard keys; Held input also accepts RBUTTON.";
         return false;
     }
 
@@ -1642,7 +1660,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        990, 390,
+        990, 450,
         nullptr,
         nullptr,
         hInstance,
