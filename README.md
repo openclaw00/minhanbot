@@ -28,14 +28,14 @@ From a Visual Studio Developer Command Prompt:
 
 ```bat
 rc minhanbot.rc
-cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comctl32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 ```
 
 Cross-compile from macOS/Linux with MinGW-w64:
 
 ```sh
 x86_64-w64-mingw32-windres minhanbot.rc -O coff -o minhanbot.res
-x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ minhanbot.cpp minhanbot.res -o minhanbot.exe -luser32 -lgdi32 -ld3d11 -ldxgi
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ minhanbot.cpp minhanbot.res -o minhanbot.exe -luser32 -lgdi32 -lcomctl32 -ld3d11 -ldxgi
 ```
 
 ## Files

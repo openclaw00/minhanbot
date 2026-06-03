@@ -3,7 +3,7 @@
 
     Build from a "Developer Command Prompt for VS":
         rc minhanbot.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comctl32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -33,6 +33,7 @@
 #endif
 
 #include <windows.h>
+#include <commctrl.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
@@ -126,6 +127,7 @@ constexpr int IDC_COOLDOWN_MAX = 1025;
 constexpr int IDC_COOLDOWN_EVERY = 1026;
 constexpr int IDC_REQUIRE_HELD_INPUT = 1027;
 constexpr int IDC_HELD_INPUT_KEY = 1028;
+constexpr int IDC_TOLERANCE_VALUE = 1029;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -184,6 +186,8 @@ struct AppState {
     HWND apply = nullptr;
     HWND stats = nullptr;
     HWND targetColorText = nullptr;
+    HWND toleranceSlider = nullptr;
+    HWND toleranceValue = nullptr;
     DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
@@ -996,6 +1000,31 @@ void SetControlInt(HWND parent, int id, int value) {
     SetWindowTextW(GetDlgItem(parent, id), buf);
 }
 
+void SetToleranceValueText(int value) {
+    if (!g_app.toleranceValue) {
+        return;
+    }
+    wchar_t text[32]{};
+    wsprintfW(text, L"%d deg", ClampInt(value, 0, 180));
+    SetWindowTextW(g_app.toleranceValue, text);
+}
+
+void SetToleranceSliderValue(int value) {
+    if (!g_app.toleranceSlider) {
+        return;
+    }
+    const int clamped = ClampInt(value, 0, 180);
+    SendMessageW(g_app.toleranceSlider, TBM_SETPOS, TRUE, clamped);
+    SetToleranceValueText(clamped);
+}
+
+int GetToleranceSliderValue() {
+    if (!g_app.toleranceSlider) {
+        return COLOR_TOLERANCE;
+    }
+    return ClampInt(static_cast<int>(SendMessageW(g_app.toleranceSlider, TBM_GETPOS, 0, 0)), 0, 180);
+}
+
 void SetTargetColorText(HWND hwnd, const RGB_COLOR& color) {
     wchar_t text[64]{};
     wsprintfW(text, L"RGB: %d,%d,%d", color.r, color.g, color.b);
@@ -1068,7 +1097,6 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
 
     if (!ParseIntControl(hwnd, IDC_WIDTH, next.captureWidth) ||
         !ParseIntControl(hwnd, IDC_HEIGHT, next.captureHeight) ||
-        !ParseIntControl(hwnd, IDC_TOLERANCE, next.tolerance) ||
         !ParseIntControl(hwnd, IDC_MIN_COLOR_PIXELS, next.minColorPixels) ||
         !ParseVirtualKeyControl(hwnd, IDC_KEY, next.targetKey) ||
         !ParseIntControl(hwnd, IDC_PRE_MIN, next.delayBeforePressMin) ||
@@ -1093,10 +1121,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         error = L"Capture width and height must be between 1 and 512 px.";
         return false;
     }
-    if (next.tolerance < 0 || next.tolerance > 180) {
-        error = L"Tolerance must be between 0 and 180 HSV hue degrees.";
-        return false;
-    }
+    next.tolerance = GetToleranceSliderValue();
     if (next.minColorPixels < 1 || next.minColorPixels > next.captureWidth * next.captureHeight) {
         error = L"Required color pixels must be between 1 and the capture area's total pixels.";
         return false;
@@ -1146,6 +1171,18 @@ HWND CreateEdit(HWND parent, int id, int x, int y, int w, int h) {
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+}
+
+HWND CreateSlider(HWND parent, int id, int x, int y, int w, int h, int minValue, int maxValue) {
+    HWND hwnd = CreateWindowExW(
+        0, TRACKBAR_CLASSW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS,
+        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(hwnd, TBM_SETRANGE, TRUE, MAKELPARAM(minValue, maxValue));
+    SendMessageW(hwnd, TBM_SETTICFREQ, 15, 0);
+    SendMessageW(hwnd, TBM_SETPAGESIZE, 0, 5);
+    SendMessageW(hwnd, TBM_SETLINESIZE, 0, 1);
+    return hwnd;
 }
 
 HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
@@ -1229,7 +1266,7 @@ void PopulateDefaults(HWND hwnd) {
     const RuntimeConfig cfg{};
     SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
     SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
-    SetControlInt(hwnd, IDC_TOLERANCE, cfg.tolerance);
+    SetToleranceSliderValue(cfg.tolerance);
     SetControlInt(hwnd, IDC_MIN_COLOR_PIXELS, cfg.minColorPixels);
     g_app.selectedTargetColor = cfg.targetColor;
     SetTargetColorText(hwnd, cfg.targetColor);
@@ -1335,8 +1372,11 @@ void CreateMainControls(HWND hwnd) {
 
     y += gap;
     CreateLabel(hwnd, L"Hue tolerance", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_TOLERANCE, leftEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"deg", leftUnitX, y, 48, rowH);
+    g_app.toleranceSlider = CreateSlider(hwnd, IDC_TOLERANCE, leftEditX, y - 6, 160, 30, 0, 180);
+    g_app.toleranceValue = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+                                           WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_CENTER,
+                                           leftEditX + 170, y - 3, 62, rowH,
+                                           hwnd, reinterpret_cast<HMENU>(IDC_TOLERANCE_VALUE), GetModuleHandleW(nullptr), nullptr);
     CreateLabel(hwnd, L"Required pixels", rightLabelX, y, labelW, rowH);
     HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, rightEditX, y - 3, editW, 160);
     PopulateHitThresholdChoices(minPixels);
@@ -1608,6 +1648,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    case WM_HSCROLL:
+        if (reinterpret_cast<HWND>(lParam) == g_app.toleranceSlider) {
+            SetToleranceValueText(GetToleranceSliderValue());
+            return 0;
+        }
+        break;
+
     case WM_APP_FRAME:
         if (g_app.preview) {
             InvalidateRect(g_app.preview, nullptr, FALSE);
@@ -1677,6 +1724,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    INITCOMMONCONTROLSEX commonControls{};
+    commonControls.dwSize = sizeof(commonControls);
+    commonControls.dwICC = ICC_BAR_CLASSES;
+    InitCommonControlsEx(&commonControls);
+
     WNDCLASSW previewClass{};
     previewClass.lpfnWndProc = PreviewProc;
     previewClass.hInstance = hInstance;
