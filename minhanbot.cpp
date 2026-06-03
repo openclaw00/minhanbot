@@ -117,6 +117,8 @@ constexpr int IDC_TARGET_COLOR = 1023;
 constexpr int IDC_COOLDOWN_MIN = 1024;
 constexpr int IDC_COOLDOWN_MAX = 1025;
 constexpr int IDC_COOLDOWN_EVERY = 1026;
+constexpr int IDC_REQUIRE_HELD_INPUT = 1027;
+constexpr int IDC_HELD_INPUT_KEY = 1028;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -154,6 +156,8 @@ struct RuntimeConfig {
     int scanIntervalMin = SCAN_INTERVAL_MIN;
     int scanIntervalMax = SCAN_INTERVAL_MAX;
     bool holdWhileVisible = true;
+    bool requireHeldInput = false;
+    DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
     std::wstring serialPort = L"COM4";
 };
@@ -652,6 +656,13 @@ void PostStatus(StatusKind status) {
     }
 }
 
+bool RequiredHeldInputActive(const RuntimeConfig& cfg) {
+    if (!cfg.requireHeldInput) {
+        return true;
+    }
+    return (GetAsyncKeyState(static_cast<int>(cfg.heldInputKey)) & 0x8000) != 0;
+}
+
 void WorkerMain() {
     ScreenCapture capture;
     KeyOutput output;
@@ -725,9 +736,11 @@ void WorkerMain() {
                 nextStatsUi = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             }
 
+            const bool heldInputActive = RequiredHeldInputActive(cfg);
+
             if (cfg.holdWhileVisible) {
                 nonHoldPressesSinceCooldown = 0;
-                if (detection.detected) {
+                if (detection.detected && heldInputActive) {
                     PostStatus(StatusKind::Detected);
                     releasePending = false;
 
@@ -746,6 +759,7 @@ void WorkerMain() {
 
                         if (g_app.armed.load(std::memory_order_relaxed) &&
                             !g_app.shuttingDown.load(std::memory_order_relaxed) &&
+                            RequiredHeldInputActive(cfg) &&
                             output.down(cfg, cfg.targetKey)) {
                             keyHeld = true;
                             heldKey = cfg.targetKey;
@@ -769,7 +783,7 @@ void WorkerMain() {
                     }
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 }
-            } else if (detection.detected) {
+            } else if (detection.detected && heldInputActive) {
                 if (keyHeld) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
@@ -787,7 +801,8 @@ void WorkerMain() {
                     g_app.shuttingDown);
 
                 if (g_app.armed.load(std::memory_order_relaxed) &&
-                    !g_app.shuttingDown.load(std::memory_order_relaxed)) {
+                    !g_app.shuttingDown.load(std::memory_order_relaxed) &&
+                    RequiredHeldInputActive(cfg)) {
                     if (output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed)) {
                         ++nonHoldPressesSinceCooldown;
                     }
@@ -886,6 +901,9 @@ bool ParseVirtualKeyControl(HWND parent, int id, DWORD& out) {
         {L"ENTER", VK_RETURN}, {L"RETURN", VK_RETURN}, {L"VK_RETURN", VK_RETURN},
         {L"TAB", VK_TAB}, {L"ESC", VK_ESCAPE}, {L"ESCAPE", VK_ESCAPE},
         {L"SHIFT", VK_SHIFT}, {L"CTRL", VK_CONTROL}, {L"CONTROL", VK_CONTROL}, {L"ALT", VK_MENU},
+        {L"LBUTTON", VK_LBUTTON}, {L"LEFTCLICK", VK_LBUTTON}, {L"LEFT_CLICK", VK_LBUTTON},
+        {L"RBUTTON", VK_RBUTTON}, {L"RIGHTCLICK", VK_RBUTTON}, {L"RIGHT_CLICK", VK_RBUTTON},
+        {L"MBUTTON", VK_MBUTTON}, {L"MIDDLECLICK", VK_MBUTTON}, {L"MIDDLE_CLICK", VK_MBUTTON},
         {L"LEFT", VK_LEFT}, {L"RIGHT", VK_RIGHT}, {L"UP", VK_UP}, {L"DOWN", VK_DOWN},
         {L"BACKSPACE", VK_BACK}, {L"DELETE", VK_DELETE}, {L"DEL", VK_DELETE},
         {L"HOME", VK_HOME}, {L"END", VK_END}, {L"PAGEUP", VK_PRIOR}, {L"PAGEDOWN", VK_NEXT},
@@ -943,6 +961,9 @@ std::wstring VirtualKeyDisplayName(DWORD vk) {
     case VK_SHIFT: return L"SHIFT";
     case VK_CONTROL: return L"CTRL";
     case VK_MENU: return L"ALT";
+    case VK_LBUTTON: return L"LBUTTON";
+    case VK_RBUTTON: return L"RBUTTON";
+    case VK_MBUTTON: return L"MBUTTON";
     case VK_LEFT: return L"LEFT";
     case VK_RIGHT: return L"RIGHT";
     case VK_UP: return L"UP";
@@ -999,8 +1020,9 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
         !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
         !ParseIntControl(hwnd, IDC_SCAN_MAX, next.scanIntervalMax) ||
+        !ParseVirtualKeyControl(hwnd, IDC_HELD_INPUT_KEY, next.heldInputKey) ||
         !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
-        error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, or F6.";
+        error = L"One or more fields are invalid. Keys accept names like SPACE, A, ENTER, F6, or RBUTTON.";
         return false;
     }
 
@@ -1035,6 +1057,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
 
     next.targetColor = g_app.selectedTargetColor;
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
+    next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
         error = L"External Arduino input needs a COM port like COM4.";
@@ -1160,9 +1183,11 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
     SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
     SetControlInt(hwnd, IDC_SCAN_MAX, cfg.scanIntervalMax);
+    SetControlKeyName(hwnd, IDC_HELD_INPUT_KEY, cfg.heldInputKey);
     SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
     SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void DrawPreview(HWND hwnd, HDC hdc) {
@@ -1307,6 +1332,14 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
     CreateEdit(hwnd, IDC_SCAN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+
+    y += gap;
+    CreateWindowExW(0, L"BUTTON", L"Only fire while held",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    leftLabelX, y - 2, 180, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_REQUIRE_HELD_INPUT), GetModuleHandleW(nullptr), nullptr);
+    CreateLabel(hwnd, L"Held input", rightLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 3, editW, rowH);
 
     y += gap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);

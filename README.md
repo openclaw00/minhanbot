@@ -7,7 +7,7 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 - Captures a small zone centered on the virtual desktop through DXGI Desktop Duplication.
 - Detects a screen-picked RGB target color with per-channel tolerance and a configurable required pixel count.
 - Sends configurable key down/up commands only to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
-- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
+- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, optional held-input gating, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
 - Shows a live zoomed preview of the monitored area.
 
 ## External Arduino input
