@@ -72,6 +72,8 @@ constexpr int DELAY_BEFORE_PRESS_MIN = 100;
 constexpr int DELAY_BEFORE_PRESS_MAX = 175;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
+constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
+constexpr int COOLDOWN_AFTER_PRESS_MAX = 0;
 constexpr int RELEASE_DELAY_MIN = 20;
 constexpr int RELEASE_DELAY_MAX = 100;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
@@ -111,6 +113,8 @@ constexpr int IDC_MIN_COLOR_PIXELS = 1020;
 constexpr int IDC_SCAN_MAX = 1021;
 constexpr int IDC_PICK_COLOR = 1022;
 constexpr int IDC_TARGET_COLOR = 1023;
+constexpr int IDC_COOLDOWN_MIN = 1024;
+constexpr int IDC_COOLDOWN_MAX = 1025;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -140,6 +144,8 @@ struct RuntimeConfig {
     int delayBeforePressMax = DELAY_BEFORE_PRESS_MAX;
     int keyHoldMin = KEY_HOLD_MIN;
     int keyHoldMax = KEY_HOLD_MAX;
+    int cooldownAfterPressMin = COOLDOWN_AFTER_PRESS_MIN;
+    int cooldownAfterPressMax = COOLDOWN_AFTER_PRESS_MAX;
     int releaseDelayMin = RELEASE_DELAY_MIN;
     int releaseDelayMax = RELEASE_DELAY_MAX;
     int scanIntervalMin = SCAN_INTERVAL_MIN;
@@ -779,6 +785,11 @@ void WorkerMain() {
                     output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed);
                 }
 
+                InterruptibleSleepMs(
+                    SampleBellCurveMs(rng, cfg.cooldownAfterPressMin, cfg.cooldownAfterPressMax),
+                    g_app.armed,
+                    g_app.shuttingDown);
+
                 PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
             } else if (keyHeld) {
                 output.up(heldConfig, heldKey);
@@ -970,6 +981,8 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_PRE_MAX, next.delayBeforePressMax) ||
         !ParseIntControl(hwnd, IDC_HOLD_MIN, next.keyHoldMin) ||
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
+        !ParseIntControl(hwnd, IDC_COOLDOWN_MIN, next.cooldownAfterPressMin) ||
+        !ParseIntControl(hwnd, IDC_COOLDOWN_MAX, next.cooldownAfterPressMax) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MIN, next.releaseDelayMin) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
         !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
@@ -994,6 +1007,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     }
     if (next.delayBeforePressMin < 0 || next.delayBeforePressMax < next.delayBeforePressMin ||
         next.keyHoldMin < 0 || next.keyHoldMax < next.keyHoldMin ||
+        next.cooldownAfterPressMin < 0 || next.cooldownAfterPressMax < next.cooldownAfterPressMin ||
         next.releaseDelayMin < 0 || next.releaseDelayMax < next.releaseDelayMin) {
         error = L"Each timing range must be non-negative and min <= max.";
         return false;
@@ -1123,6 +1137,8 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
     SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
+    SetControlInt(hwnd, IDC_COOLDOWN_MIN, cfg.cooldownAfterPressMin);
+    SetControlInt(hwnd, IDC_COOLDOWN_MAX, cfg.cooldownAfterPressMax);
     SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
     SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
     SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
@@ -1243,6 +1259,13 @@ void CreateMainControls(HWND hwnd) {
     CreateEdit(hwnd, IDC_HOLD_MIN, leftEditX, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
     CreateEdit(hwnd, IDC_HOLD_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+
+    y += gap;
+    CreateLabel(hwnd, L"Cooldown after key", leftLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_MIN, leftEditX, y - 3, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
 
     y += gap;
