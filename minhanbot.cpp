@@ -55,7 +55,7 @@
 constexpr int CAPTURE_WIDTH = 25;
 constexpr int CAPTURE_HEIGHT = 25;
 constexpr int COLOR_TOLERANCE = 40;
-constexpr int MIN_COLOR_PIXELS = 1;
+constexpr int MIN_COLOR_PIXELS = 2;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
 constexpr int TARGET_COLOR_R = 222;
 constexpr int TARGET_COLOR_G = 132;
@@ -68,15 +68,15 @@ struct RGB_COLOR {
 };
 
 // Humanization / cadence jitter timing (milliseconds).
-constexpr int DELAY_BEFORE_PRESS_MIN = 100;
-constexpr int DELAY_BEFORE_PRESS_MAX = 175;
+constexpr int DELAY_BEFORE_PRESS_MIN = 30;
+constexpr int DELAY_BEFORE_PRESS_MAX = 75;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
 constexpr int COOLDOWN_AFTER_PRESS_MAX = 0;
 constexpr int COOLDOWN_AFTER_PRESS_EVERY = 1;
-constexpr int RELEASE_DELAY_MIN = 20;
-constexpr int RELEASE_DELAY_MAX = 100;
+constexpr int RELEASE_DELAY_MIN = 1;
+constexpr int RELEASE_DELAY_MAX = 15;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
 constexpr int IDI_APP_ICON = 1;
 
