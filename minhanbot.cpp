@@ -74,6 +74,7 @@ constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
 constexpr int COOLDOWN_AFTER_PRESS_MAX = 0;
+constexpr int COOLDOWN_AFTER_PRESS_EVERY = 1;
 constexpr int RELEASE_DELAY_MIN = 20;
 constexpr int RELEASE_DELAY_MAX = 100;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
@@ -115,6 +116,7 @@ constexpr int IDC_PICK_COLOR = 1022;
 constexpr int IDC_TARGET_COLOR = 1023;
 constexpr int IDC_COOLDOWN_MIN = 1024;
 constexpr int IDC_COOLDOWN_MAX = 1025;
+constexpr int IDC_COOLDOWN_EVERY = 1026;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -146,6 +148,7 @@ struct RuntimeConfig {
     int keyHoldMax = KEY_HOLD_MAX;
     int cooldownAfterPressMin = COOLDOWN_AFTER_PRESS_MIN;
     int cooldownAfterPressMax = COOLDOWN_AFTER_PRESS_MAX;
+    int cooldownAfterPressEvery = COOLDOWN_AFTER_PRESS_EVERY;
     int releaseDelayMin = RELEASE_DELAY_MIN;
     int releaseDelayMax = RELEASE_DELAY_MAX;
     int scanIntervalMin = SCAN_INTERVAL_MIN;
@@ -660,6 +663,7 @@ void WorkerMain() {
     RuntimeConfig heldConfig;
     bool releasePending = false;
     auto releaseAt = std::chrono::steady_clock::now();
+    int nonHoldPressesSinceCooldown = 0;
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
@@ -669,6 +673,7 @@ void WorkerMain() {
                 heldKey = 0;
             }
             releasePending = false;
+            nonHoldPressesSinceCooldown = 0;
             Sleep(10);
             continue;
         }
@@ -721,6 +726,7 @@ void WorkerMain() {
             }
 
             if (cfg.holdWhileVisible) {
+                nonHoldPressesSinceCooldown = 0;
                 if (detection.detected) {
                     PostStatus(StatusKind::Detected);
                     releasePending = false;
@@ -782,13 +788,18 @@ void WorkerMain() {
 
                 if (g_app.armed.load(std::memory_order_relaxed) &&
                     !g_app.shuttingDown.load(std::memory_order_relaxed)) {
-                    output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed);
+                    if (output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed)) {
+                        ++nonHoldPressesSinceCooldown;
+                    }
                 }
 
-                InterruptibleSleepMs(
-                    SampleBellCurveMs(rng, cfg.cooldownAfterPressMin, cfg.cooldownAfterPressMax),
-                    g_app.armed,
-                    g_app.shuttingDown);
+                if (nonHoldPressesSinceCooldown >= cfg.cooldownAfterPressEvery) {
+                    nonHoldPressesSinceCooldown = 0;
+                    InterruptibleSleepMs(
+                        SampleBellCurveMs(rng, cfg.cooldownAfterPressMin, cfg.cooldownAfterPressMax),
+                        g_app.armed,
+                        g_app.shuttingDown);
+                }
 
                 PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
             } else if (keyHeld) {
@@ -983,6 +994,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_HOLD_MAX, next.keyHoldMax) ||
         !ParseIntControl(hwnd, IDC_COOLDOWN_MIN, next.cooldownAfterPressMin) ||
         !ParseIntControl(hwnd, IDC_COOLDOWN_MAX, next.cooldownAfterPressMax) ||
+        !ParseIntControl(hwnd, IDC_COOLDOWN_EVERY, next.cooldownAfterPressEvery) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MIN, next.releaseDelayMin) ||
         !ParseIntControl(hwnd, IDC_RELEASE_MAX, next.releaseDelayMax) ||
         !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
@@ -1010,6 +1022,10 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         next.cooldownAfterPressMin < 0 || next.cooldownAfterPressMax < next.cooldownAfterPressMin ||
         next.releaseDelayMin < 0 || next.releaseDelayMax < next.releaseDelayMin) {
         error = L"Each timing range must be non-negative and min <= max.";
+        return false;
+    }
+    if (next.cooldownAfterPressEvery < 1 || next.cooldownAfterPressEvery > 1000) {
+        error = L"Cooldown every must be between 1 and 1000 activations.";
         return false;
     }
     if (next.scanIntervalMin < 0 || next.scanIntervalMax < next.scanIntervalMin || next.scanIntervalMax > 1000) {
@@ -1139,6 +1155,7 @@ void PopulateDefaults(HWND hwnd) {
     SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
     SetControlInt(hwnd, IDC_COOLDOWN_MIN, cfg.cooldownAfterPressMin);
     SetControlInt(hwnd, IDC_COOLDOWN_MAX, cfg.cooldownAfterPressMax);
+    SetControlInt(hwnd, IDC_COOLDOWN_EVERY, cfg.cooldownAfterPressEvery);
     SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
     SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
     SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
@@ -1267,6 +1284,9 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
     CreateEdit(hwnd, IDC_COOLDOWN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
     CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateLabel(hwnd, L"Cooldown every", rightLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_EVERY, rightEditX, y - 3, editW, rowH);
+    CreateLabel(hwnd, L"hits", rightUnitX, y, 48, rowH);
 
     y += gap;
     CreateWindowExW(0, L"BUTTON", L"Hold key while color is visible",
