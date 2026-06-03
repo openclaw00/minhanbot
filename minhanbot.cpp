@@ -12,7 +12,7 @@
 
     What it does:
         - Captures a small zone centered on the virtual desktop.
-        - Checks every captured pixel against the target RGB colors with a per-channel tolerance.
+        - Checks every captured pixel against the target color in HSV with a hue tolerance.
         - Requires a configurable number of matching color pixels before triggering.
         - When a match is found, either taps the configured key or holds it until the color disappears.
         - Uses randomized pre-press, key-hold, release, and scan timing to avoid rigid cadence.
@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -65,6 +66,12 @@ struct RGB_COLOR {
     int r;
     int g;
     int b;
+};
+
+struct HSV_COLOR {
+    double h;
+    double s;
+    double v;
 };
 
 // Humanization / cadence jitter timing (milliseconds).
@@ -230,6 +237,40 @@ void SafeRelease(T*& ptr) {
 
 int ClampInt(int value, int lo, int hi) {
     return std::max(lo, std::min(value, hi));
+}
+
+HSV_COLOR RgbToHsv(const RGB_COLOR& color) {
+    const double r = static_cast<double>(ClampInt(color.r, 0, 255)) / 255.0;
+    const double g = static_cast<double>(ClampInt(color.g, 0, 255)) / 255.0;
+    const double b = static_cast<double>(ClampInt(color.b, 0, 255)) / 255.0;
+    const double maxValue = std::max({r, g, b});
+    const double minValue = std::min({r, g, b});
+    const double chroma = maxValue - minValue;
+
+    double hue = 0.0;
+    if (chroma > 0.0) {
+        if (maxValue == r) {
+            hue = 60.0 * std::fmod(((g - b) / chroma), 6.0);
+        } else if (maxValue == g) {
+            hue = 60.0 * (((b - r) / chroma) + 2.0);
+        } else {
+            hue = 60.0 * (((r - g) / chroma) + 4.0);
+        }
+    }
+    if (hue < 0.0) {
+        hue += 360.0;
+    }
+
+    const double saturation = maxValue == 0.0 ? 0.0 : chroma / maxValue;
+    return {hue, saturation, maxValue};
+}
+
+double HueDeltaDegrees(double a, double b) {
+    double delta = std::fabs(a - b);
+    if (delta > 180.0) {
+        delta = 360.0 - delta;
+    }
+    return delta;
 }
 
 class ScreenCapture {
@@ -497,23 +538,26 @@ DetectionResult AnalyzeTargetColors(
     int tolerance,
     int minColorPixels) {
     DetectionResult result{};
+    const HSV_COLOR targetHsv = RgbToHsv(target);
+    const double hueTolerance = static_cast<double>(ClampInt(tolerance, 0, 180));
+    const double minSaturation = std::max(0.10, targetHsv.s * 0.35);
+    const double minValue = std::max(0.08, targetHsv.v * 0.20);
 
     for (std::size_t i = 0; i < pixels; ++i) {
         const std::uint8_t b = bgra[i * 4 + 0];
         const std::uint8_t g = bgra[i * 4 + 1];
         const std::uint8_t r = bgra[i * 4 + 2];
+        const RGB_COLOR pixel{static_cast<int>(r), static_cast<int>(g), static_cast<int>(b)};
+        const HSV_COLOR pixelHsv = RgbToHsv(pixel);
 
-        const int dr = std::abs(static_cast<int>(r) - target.r);
-        const int dg = std::abs(static_cast<int>(g) - target.g);
-        const int db = std::abs(static_cast<int>(b) - target.b);
-        const int maxDelta = std::max({dr, dg, db});
+        const int hueDelta = static_cast<int>(std::round(HueDeltaDegrees(pixelHsv.h, targetHsv.h)));
 
-        if (maxDelta < result.closestDelta) {
-            result.closestDelta = maxDelta;
-            result.closest = {static_cast<int>(r), static_cast<int>(g), static_cast<int>(b)};
+        if (hueDelta < result.closestDelta) {
+            result.closestDelta = hueDelta;
+            result.closest = pixel;
         }
 
-        if (dr <= tolerance && dg <= tolerance && db <= tolerance) {
+        if (hueDelta <= hueTolerance && pixelHsv.s >= minSaturation && pixelHsv.v >= minValue) {
             ++result.hits;
         }
     }
@@ -697,7 +741,7 @@ void WorkerMain() {
 
         cfg.captureWidth = ClampInt(cfg.captureWidth, 1, 512);
         cfg.captureHeight = ClampInt(cfg.captureHeight, 1, 512);
-        cfg.tolerance = ClampInt(cfg.tolerance, 0, 255);
+        cfg.tolerance = ClampInt(cfg.tolerance, 0, 180);
         cfg.minColorPixels = ClampInt(cfg.minColorPixels, 1, cfg.captureWidth * cfg.captureHeight);
 
         if (!capture.ensure(cfg.captureWidth, cfg.captureHeight)) {
@@ -1049,8 +1093,8 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         error = L"Capture width and height must be between 1 and 512 px.";
         return false;
     }
-    if (next.tolerance < 0 || next.tolerance > 255) {
-        error = L"Tolerance must be between 0 and 255 RGB levels.";
+    if (next.tolerance < 0 || next.tolerance > 180) {
+        error = L"Tolerance must be between 0 and 180 HSV hue degrees.";
         return false;
     }
     if (next.minColorPixels < 1 || next.minColorPixels > next.captureWidth * next.captureHeight) {
@@ -1290,9 +1334,9 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"px", rightUnitX, y, 30, rowH);
 
     y += gap;
-    CreateLabel(hwnd, L"Tolerance", leftLabelX, y, labelW, rowH);
+    CreateLabel(hwnd, L"Hue tolerance", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_TOLERANCE, leftEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"RGB", leftUnitX, y, 48, rowH);
+    CreateLabel(hwnd, L"deg", leftUnitX, y, 48, rowH);
     CreateLabel(hwnd, L"Required pixels", rightLabelX, y, labelW, rowH);
     HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, rightEditX, y - 3, editW, 160);
     PopulateHitThresholdChoices(minPixels);
@@ -1588,7 +1632,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t text[128]{};
         wsprintfW(
             text,
-            L"Hits: %d/%d  Closest RGB: %d,%d,%d  +/- %d",
+            L"Hits: %d/%d  Closest RGB: %d,%d,%d  Hue +/- %d deg",
             g_app.lastHits.load(std::memory_order_relaxed),
             g_app.requiredHits.load(std::memory_order_relaxed),
             g_app.closestR.load(std::memory_order_relaxed),
