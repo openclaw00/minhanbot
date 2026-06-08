@@ -53,8 +53,8 @@
 #include <vector>
 
 // === CONFIGURATION ===
-constexpr int CAPTURE_WIDTH = 25;
-constexpr int CAPTURE_HEIGHT = 25;
+constexpr int CAPTURE_WIDTH = 15;
+constexpr int CAPTURE_HEIGHT = 15;
 constexpr int COLOR_TOLERANCE = 40;
 constexpr int MIN_COLOR_PIXELS = 2;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
@@ -69,8 +69,8 @@ struct RGB_COLOR {
 };
 
 // Humanization / cadence jitter timing (milliseconds).
-constexpr int DELAY_BEFORE_PRESS_MIN = 30;
-constexpr int DELAY_BEFORE_PRESS_MAX = 75;
+constexpr int DELAY_BEFORE_PRESS_MIN = 20;
+constexpr int DELAY_BEFORE_PRESS_MAX = 50;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
@@ -161,7 +161,7 @@ struct RuntimeConfig {
     bool requireHeldInput = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
-    std::wstring serialPort = L"COM4";
+    std::wstring serialPort = L"COM6";
 };
 
 struct FrameBuffer {
@@ -1103,7 +1103,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
-        error = L"External Arduino input needs a COM port like COM4.";
+        error = L"External Arduino input needs a COM port like COM6.";
         return false;
     }
 
