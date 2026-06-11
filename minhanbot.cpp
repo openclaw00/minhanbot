@@ -122,16 +122,21 @@ constexpr int IDC_REQUIRE_HELD_INPUT = 1027;
 constexpr int IDC_HELD_INPUT_KEY = 1028;
 constexpr int IDC_TOLERANCE_VALUE = 1029;
 
-// Black-and-white dark UI theme.
-constexpr COLORREF THEME_BG = RGB(8, 8, 8);
-constexpr COLORREF THEME_PANEL = RGB(18, 18, 18);
-constexpr COLORREF THEME_FIELD = RGB(12, 12, 12);
-constexpr COLORREF THEME_FIELD_ALT = RGB(28, 28, 28);
-constexpr COLORREF THEME_BORDER = RGB(82, 82, 82);
-constexpr COLORREF THEME_BORDER_HOT = RGB(170, 170, 170);
-constexpr COLORREF THEME_TEXT = RGB(245, 245, 245);
-constexpr COLORREF THEME_MUTED = RGB(178, 178, 178);
-constexpr COLORREF THEME_DISABLED = RGB(94, 94, 94);
+// Dark utility UI theme.
+constexpr COLORREF THEME_BG = RGB(10, 13, 16);
+constexpr COLORREF THEME_PANEL = RGB(15, 19, 24);
+constexpr COLORREF THEME_PANEL_HOT = RGB(24, 29, 37);
+constexpr COLORREF THEME_FIELD = RGB(9, 12, 16);
+constexpr COLORREF THEME_FIELD_ALT = RGB(23, 27, 34);
+constexpr COLORREF THEME_BORDER = RGB(48, 55, 66);
+constexpr COLORREF THEME_BORDER_HOT = RGB(131, 92, 214);
+constexpr COLORREF THEME_ACCENT = RGB(158, 106, 255);
+constexpr COLORREF THEME_ACCENT_DIM = RGB(82, 54, 142);
+constexpr COLORREF THEME_TEXT = RGB(236, 239, 244);
+constexpr COLORREF THEME_MUTED = RGB(174, 181, 192);
+constexpr COLORREF THEME_DISABLED = RGB(91, 98, 109);
+constexpr COLORREF THEME_DANGER = RGB(255, 72, 92);
+constexpr COLORREF THEME_SUCCESS = RGB(84, 210, 133);
 
 enum class StatusKind : int {
     Disarmed,
@@ -181,6 +186,9 @@ struct AppState {
     HWND targetColorText = nullptr;
     HWND toleranceSlider = nullptr;
     HWND toleranceValue = nullptr;
+    HFONT uiFont = nullptr;
+    HFONT headerFont = nullptr;
+    HFONT titleFont = nullptr;
     DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
@@ -214,6 +222,11 @@ HBRUSH ThemePanelBrush() {
     return brush;
 }
 
+HBRUSH ThemePanelHotBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_PANEL_HOT);
+    return brush;
+}
+
 HBRUSH ThemeFieldBrush() {
     static HBRUSH brush = CreateSolidBrush(THEME_FIELD);
     return brush;
@@ -234,6 +247,34 @@ void SafeRelease(T*& ptr) {
 
 int ClampInt(int value, int lo, int hi) {
     return std::max(lo, std::min(value, hi));
+}
+
+HFONT CreateUiFont(int pointSize, int weight) {
+    HDC hdc = GetDC(nullptr);
+    const int height = -MulDiv(pointSize, GetDeviceCaps(hdc, LOGPIXELSY), 72);
+    ReleaseDC(nullptr, hdc);
+    return CreateFontW(
+        height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+}
+
+void CreateAppFonts() {
+    g_app.uiFont = CreateUiFont(10, FW_NORMAL);
+    g_app.headerFont = CreateUiFont(10, FW_SEMIBOLD);
+    g_app.titleFont = CreateUiFont(12, FW_SEMIBOLD);
+}
+
+BOOL CALLBACK ApplyFontToChild(HWND child, LPARAM fontParam) {
+    SendMessageW(child, WM_SETFONT, fontParam, TRUE);
+    return TRUE;
+}
+
+void ApplyFonts(HWND hwnd) {
+    if (!g_app.uiFont) {
+        return;
+    }
+    EnumChildWindows(hwnd, ApplyFontToChild, reinterpret_cast<LPARAM>(g_app.uiFont));
 }
 
 class ScreenCapture {
@@ -1165,6 +1206,106 @@ void PopulateSerialPortChoices(HWND combo) {
     }
 }
 
+void FillRoundRect(HDC hdc, const RECT& rc, COLORREF fillColor, COLORREF borderColor) {
+    HBRUSH fill = CreateSolidBrush(fillColor);
+    HPEN border = CreatePen(PS_SOLID, 1, borderColor);
+    HGDIOBJ oldBrush = SelectObject(hdc, fill);
+    HGDIOBJ oldPen = SelectObject(hdc, border);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(border);
+    DeleteObject(fill);
+}
+
+void DrawSectionIcon(HDC hdc, int kind, int x, int y) {
+    HPEN accentPen = CreatePen(PS_SOLID, 2, THEME_ACCENT);
+    HBRUSH accentBrush = CreateSolidBrush(THEME_ACCENT);
+    HGDIOBJ oldPen = SelectObject(hdc, accentPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+    switch (kind) {
+    case 0:
+        Rectangle(hdc, x + 2, y + 2, x + 16, y + 16);
+        MoveToEx(hdc, x, y + 8, nullptr);
+        LineTo(hdc, x + 5, y + 8);
+        MoveToEx(hdc, x + 13, y + 8, nullptr);
+        LineTo(hdc, x + 19, y + 8);
+        MoveToEx(hdc, x + 9, y, nullptr);
+        LineTo(hdc, x + 9, y + 5);
+        MoveToEx(hdc, x + 9, y + 13, nullptr);
+        LineTo(hdc, x + 9, y + 19);
+        break;
+    case 1:
+        SelectObject(hdc, accentBrush);
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                Ellipse(hdc, x + col * 7, y + row * 7, x + col * 7 + 4, y + row * 7 + 4);
+            }
+        }
+        break;
+    case 2:
+        Ellipse(hdc, x + 1, y + 1, x + 18, y + 18);
+        MoveToEx(hdc, x + 9, y + 4, nullptr);
+        LineTo(hdc, x + 9, y + 10);
+        LineTo(hdc, x + 14, y + 13);
+        break;
+    default:
+        Rectangle(hdc, x + 1, y + 2, x + 18, y + 16);
+        MoveToEx(hdc, x + 4, y + 6, nullptr);
+        LineTo(hdc, x + 15, y + 6);
+        MoveToEx(hdc, x + 4, y + 10, nullptr);
+        LineTo(hdc, x + 15, y + 10);
+        MoveToEx(hdc, x + 7, y + 2, nullptr);
+        LineTo(hdc, x + 7, y + 16);
+        break;
+    }
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(accentBrush);
+    DeleteObject(accentPen);
+}
+
+void DrawSection(HDC hdc, const RECT& rc, const wchar_t* title, int iconKind) {
+    FillRoundRect(hdc, rc, THEME_PANEL, THEME_BORDER);
+    DrawSectionIcon(hdc, iconKind, rc.left + 18, rc.top + 20);
+
+    RECT titleRc{rc.left + 48, rc.top + 16, rc.right - 16, rc.top + 42};
+    HGDIOBJ oldFont = SelectObject(hdc, g_app.headerFont ? g_app.headerFont : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, THEME_ACCENT);
+    DrawTextW(hdc, title, -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(hdc, oldFont);
+}
+
+void DrawMainChrome(HWND hwnd, HDC hdc) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    FillRect(hdc, &rc, ThemeBackgroundBrush());
+
+    RECT top{16, 14, 722, 74};
+    RECT capture{16, 88, 354, 250};
+    RECT detection{370, 88, 722, 250};
+    RECT timing{16, 266, 722, 514};
+    RECT hardware{16, 530, 722, 646};
+    RECT preview{738, 14, 1050, 646};
+
+    FillRoundRect(hdc, top, THEME_PANEL, THEME_BORDER);
+    DrawSection(hdc, capture, L"CAPTURE", 0);
+    DrawSection(hdc, detection, L"DETECTION", 1);
+    DrawSection(hdc, timing, L"TIMING", 2);
+    DrawSection(hdc, hardware, L"INPUT & HARDWARE", 3);
+    DrawSection(hdc, preview, L"LIVE PREVIEW", 0);
+
+    HGDIOBJ oldFont = SelectObject(hdc, g_app.titleFont ? g_app.titleFont : GetStockObject(DEFAULT_GUI_FONT));
+    RECT titleRc{36, 32, 118, 58};
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, THEME_TEXT);
+    DrawTextW(hdc, L"minhanbot", -1, &titleRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(hdc, oldFont);
+}
+
 void DrawButtonControl(const DRAWITEMSTRUCT& item) {
     HDC hdc = item.hDC;
     RECT rc = item.rcItem;
@@ -1172,17 +1313,42 @@ void DrawButtonControl(const DRAWITEMSTRUCT& item) {
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const bool focused = (item.itemState & ODS_FOCUS) != 0;
 
-    HBRUSH fill = CreateSolidBrush(disabled ? RGB(20, 20, 20) : (pressed ? RGB(36, 36, 36) : THEME_PANEL));
+    const int id = static_cast<int>(item.CtlID);
+    const bool primary = id == IDC_START;
+    const COLORREF fillColor = disabled ? RGB(20, 24, 30) :
+        (primary ? (pressed ? THEME_ACCENT_DIM : RGB(73, 45, 132)) :
+                   (pressed ? THEME_PANEL_HOT : THEME_FIELD));
+    HBRUSH fill = CreateSolidBrush(fillColor);
     FillRect(hdc, &rc, fill);
     DeleteObject(fill);
 
-    HPEN border = CreatePen(PS_SOLID, 1, focused ? THEME_BORDER_HOT : THEME_BORDER);
+    HPEN border = CreatePen(PS_SOLID, 1, focused || primary ? THEME_BORDER_HOT : THEME_BORDER);
     HGDIOBJ oldPen = SelectObject(hdc, border);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
     DeleteObject(border);
+
+    RECT iconRc{rc.left + 14, rc.top + 12, rc.left + 31, rc.top + 29};
+    HBRUSH iconBrush = CreateSolidBrush(disabled ? THEME_DISABLED : (primary ? RGB(214, 194, 255) : THEME_TEXT));
+    HGDIOBJ oldIconBrush = SelectObject(hdc, iconBrush);
+    HGDIOBJ oldIconPen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    if (id == IDC_START) {
+        POINT pts[] = {{iconRc.left, iconRc.top}, {iconRc.right, (iconRc.top + iconRc.bottom) / 2}, {iconRc.left, iconRc.bottom}};
+        Polygon(hdc, pts, 3);
+    } else if (id == IDC_STOP) {
+        Rectangle(hdc, iconRc.left + 2, iconRc.top + 2, iconRc.right - 2, iconRc.bottom - 2);
+    } else if (id == IDC_APPLY) {
+        Rectangle(hdc, iconRc.left + 1, iconRc.top + 1, iconRc.right - 1, iconRc.bottom - 1);
+        RECT slot{iconRc.left + 4, iconRc.top + 3, iconRc.right - 4, iconRc.top + 8};
+        FillRect(hdc, &slot, ThemeFieldBrush());
+        RECT label{iconRc.left + 5, iconRc.bottom - 6, iconRc.right - 5, iconRc.bottom - 3};
+        FillRect(hdc, &label, ThemeFieldBrush());
+    }
+    SelectObject(hdc, oldIconPen);
+    SelectObject(hdc, oldIconBrush);
+    DeleteObject(iconBrush);
 
     wchar_t text[128]{};
     GetWindowTextW(item.hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
@@ -1191,7 +1357,10 @@ void DrawButtonControl(const DRAWITEMSTRUCT& item) {
     if (pressed) {
         OffsetRect(&rc, 1, 1);
     }
-    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    HGDIOBJ oldFont = SelectObject(hdc, g_app.headerFont ? g_app.headerFont : GetStockObject(DEFAULT_GUI_FONT));
+    RECT textRc{rc.left + 38, rc.top, rc.right - 10, rc.bottom};
+    DrawTextW(hdc, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(hdc, oldFont);
 }
 
 void ApplyCtlColor(HDC hdc, COLORREF bg, COLORREF fg = THEME_TEXT) {
@@ -1297,124 +1466,135 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 
 void CreateMainControls(HWND hwnd) {
-    g_app.start = CreateButton(hwnd, IDC_START, L"Start", 16, 16, 86, 30);
-    g_app.stop = CreateButton(hwnd, IDC_STOP, L"Stop", 112, 16, 86, 30);
-    g_app.apply = CreateButton(hwnd, IDC_APPLY, L"Apply", 208, 16, 86, 30);
+    g_app.start = CreateButton(hwnd, IDC_START, L"Start", 142, 24, 120, 38);
+    g_app.stop = CreateButton(hwnd, IDC_STOP, L"Stop", 274, 24, 120, 38);
+    g_app.apply = CreateButton(hwnd, IDC_APPLY, L"Apply", 406, 24, 120, 38);
 
-    CreateLabel(hwnd, L"Status", 360, 21, 60, 20);
+    CreateLabel(hwnd, L"Status", 560, 33, 54, 20);
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                   430, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+                                   622, 24, 82, 38, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
 
-    int y = 66;
-    constexpr int labelW = 150;
-    constexpr int editW = 90;
-    constexpr int smallEditW = 70;
-    constexpr int rowH = 24;
-    constexpr int gap = 30;
-    constexpr int leftLabelX = 16;
-    constexpr int leftEditX = 190;
-    constexpr int leftUnitX = 292;
-    constexpr int rightLabelX = 420;
-    constexpr int rightEditX = 560;
-    constexpr int rightUnitX = 662;
+    constexpr int labelW = 126;
+    constexpr int editW = 96;
+    constexpr int smallEditW = 76;
+    constexpr int rowH = 26;
+    constexpr int rowGap = 34;
 
-    CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", leftUnitX, y, 30, rowH);
-    CreateLabel(hwnd, L"Capture height", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HEIGHT, rightEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", rightUnitX, y, 30, rowH);
+    constexpr int capLabelX = 38;
+    constexpr int capEditX = 178;
+    constexpr int capUnitX = 286;
+    constexpr int detLabelX = 396;
+    constexpr int detEditX = 542;
+    constexpr int detUnitX = 650;
+    constexpr int leftLabelX = 38;
+    constexpr int leftEditX = 178;
+    constexpr int leftUnitX = 370;
+    constexpr int rightLabelX = 436;
+    constexpr int rightEditX = 566;
+    constexpr int rightUnitX = 674;
 
-    y += gap;
-    CreateLabel(hwnd, L"RGB tolerance", leftLabelX, y, labelW, rowH);
-    g_app.toleranceSlider = CreateSlider(hwnd, IDC_TOLERANCE, leftEditX, y - 6, 160, 30, 0, 255);
+    int y = 132;
+    CreateLabel(hwnd, L"Capture width", capLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_WIDTH, capEditX, y - 4, editW, rowH);
+    CreateLabel(hwnd, L"px", capUnitX, y, 28, rowH);
+
+    y += rowGap;
+    CreateLabel(hwnd, L"RGB tolerance", capLabelX, y, labelW, rowH);
+    g_app.toleranceSlider = CreateSlider(hwnd, IDC_TOLERANCE, capEditX, y - 7, 132, 30, 0, 255);
     g_app.toleranceValue = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
                                            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_CENTER,
-                                           leftEditX + 170, y - 3, 62, rowH,
+                                           capEditX + 142, y - 4, 52, rowH,
                                            hwnd, reinterpret_cast<HMENU>(IDC_TOLERANCE_VALUE), GetModuleHandleW(nullptr), nullptr);
-    CreateLabel(hwnd, L"Required pixels", rightLabelX, y, labelW, rowH);
-    HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, rightEditX, y - 3, editW, 160);
-    PopulateHitThresholdChoices(minPixels);
 
-    y += gap;
-    CreateLabel(hwnd, L"Target color", leftLabelX, y, labelW, rowH);
-    CreateButton(hwnd, IDC_PICK_COLOR, L"Pick screen", leftEditX, y - 3, editW, rowH);
+    y += rowGap;
+    CreateLabel(hwnd, L"Target color", capLabelX, y, labelW, rowH);
+    CreateButton(hwnd, IDC_PICK_COLOR, L"Pick screen", capEditX, y - 4, 106, rowH);
     g_app.targetColorText = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
                                             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                            leftEditX + 108, y - 3, 150, rowH,
+                                            capEditX + 120, y - 4, 138, rowH,
                                             hwnd, reinterpret_cast<HMENU>(IDC_TARGET_COLOR), GetModuleHandleW(nullptr), nullptr);
 
-    y += gap;
+    y = 132;
+    CreateLabel(hwnd, L"Capture height", detLabelX, y, labelW, rowH);
+    CreateEdit(hwnd, IDC_HEIGHT, detEditX, y - 4, editW, rowH);
+    CreateLabel(hwnd, L"px", detUnitX, y, 28, rowH);
+
+    y += rowGap;
+    CreateLabel(hwnd, L"Required pixels", detLabelX, y, labelW, rowH);
+    HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, detEditX, y - 4, 146, 160);
+    PopulateHitThresholdChoices(minPixels);
+
+    y = 310;
     CreateLabel(hwnd, L"Delay before key", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_PRE_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_PRE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateEdit(hwnd, IDC_PRE_MIN, leftEditX, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 88, y, 24, rowH);
+    CreateEdit(hwnd, IDC_PRE_MAX, leftEditX + 116, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
     CreateLabel(hwnd, L"Key to press", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 3, editW, rowH);
+    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 4, 146, rowH);
 
-    y += gap;
+    y += rowGap;
     CreateLabel(hwnd, L"Key press length", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MIN, leftEditX, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 88, y, 24, rowH);
+    CreateEdit(hwnd, IDC_HOLD_MAX, leftEditX + 116, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
 
-    y += gap;
+    y += rowGap;
     CreateLabel(hwnd, L"Cooldown after key", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_MIN, leftEditX, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 88, y, 24, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_MAX, leftEditX + 116, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
     CreateLabel(hwnd, L"Cooldown every", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_EVERY, rightEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"hits", rightUnitX, y, 48, rowH);
+    CreateEdit(hwnd, IDC_COOLDOWN_EVERY, rightEditX, y - 4, editW, rowH);
+    CreateLabel(hwnd, L"hits", rightUnitX, y, 42, rowH);
 
-    y += gap;
+    y += rowGap;
     CreateWindowExW(0, L"BUTTON", L"Hold key while color is visible",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     leftLabelX, y - 2, 300, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_HOLD_WHILE_VISIBLE), GetModuleHandleW(nullptr), nullptr);
 
-    y += gap;
+    y += rowGap;
     CreateLabel(hwnd, L"Release delay", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_RELEASE_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_RELEASE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateEdit(hwnd, IDC_RELEASE_MIN, leftEditX, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 88, y, 24, rowH);
+    CreateEdit(hwnd, IDC_RELEASE_MAX, leftEditX + 116, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
 
-    y += gap;
+    y += rowGap;
     CreateLabel(hwnd, L"Scan interval", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_SCAN_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_SCAN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateEdit(hwnd, IDC_SCAN_MIN, leftEditX, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"to", leftEditX + 88, y, 24, rowH);
+    CreateEdit(hwnd, IDC_SCAN_MAX, leftEditX + 116, y - 4, smallEditW, rowH);
+    CreateLabel(hwnd, L"ms", leftUnitX, y, 30, rowH);
 
-    y += gap;
+    y = 578;
     CreateWindowExW(0, L"BUTTON", L"Only fire while held",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     leftLabelX, y - 2, 180, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_REQUIRE_HELD_INPUT), GetModuleHandleW(nullptr), nullptr);
     CreateLabel(hwnd, L"Held input", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 3, editW, rowH);
+    CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 4, 146, rowH);
 
-    y += gap;
+    y += rowGap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 3, editW, rowH);
+    CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 4, 146, rowH);
 
     CreateLabel(hwnd, L"Arduino COM port", rightLabelX, y, labelW, rowH);
-    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 3, editW, 180);
+    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 4, 146, 180);
     PopulateSerialPortChoices(serialPort);
 
-    CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
                                     WS_CHILD | WS_VISIBLE,
-                                    680, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                    760, 88, 268, 462, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
                                   WS_CHILD | WS_VISIBLE,
-                                  680, 250, 280, 24, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  760, 568, 268, 44, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
+    ApplyFonts(hwnd);
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
 }
@@ -1531,6 +1711,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
         g_app.hwnd = hwnd;
+        CreateAppFonts();
         EnableDarkTitleBar(hwnd);
         CreateMainControls(hwnd);
         ApplyConfig(hwnd);
@@ -1538,10 +1719,16 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_ERASEBKGND: {
-        RECT rc{};
-        GetClientRect(hwnd, &rc);
-        FillRect(reinterpret_cast<HDC>(wParam), &rc, ThemeBackgroundBrush());
+        DrawMainChrome(hwnd, reinterpret_cast<HDC>(wParam));
         return 1;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        DrawMainChrome(hwnd, hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
     }
 
     case WM_COMMAND:
@@ -1567,12 +1754,24 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HDC hdc = reinterpret_cast<HDC>(wParam);
         HWND child = reinterpret_cast<HWND>(lParam);
         const int id = GetDlgCtrlID(child);
-        if (id == IDC_STATUS || id == IDC_TARGET_COLOR) {
+        if (id == IDC_STATUS) {
+            wchar_t status[32]{};
+            GetWindowTextW(child, status, static_cast<int>(sizeof(status) / sizeof(status[0])));
+            COLORREF statusColor = THEME_DANGER;
+            if (wcscmp(status, L"Armed") == 0) {
+                statusColor = THEME_SUCCESS;
+            } else if (wcscmp(status, L"Detected") == 0) {
+                statusColor = THEME_ACCENT;
+            }
+            ApplyCtlColor(hdc, THEME_PANEL_HOT, statusColor);
+            return reinterpret_cast<LRESULT>(ThemePanelHotBrush());
+        }
+        if (id == IDC_TARGET_COLOR || id == IDC_TOLERANCE_VALUE) {
             ApplyCtlColor(hdc, THEME_PANEL);
             return reinterpret_cast<LRESULT>(ThemePanelBrush());
         }
-        ApplyCtlColor(hdc, THEME_BG, THEME_MUTED);
-        return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
+        ApplyCtlColor(hdc, THEME_PANEL, THEME_MUTED);
+        return reinterpret_cast<LRESULT>(ThemePanelBrush());
     }
 
     case WM_CTLCOLOREDIT: {
@@ -1589,8 +1788,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_CTLCOLORBTN: {
         HDC hdc = reinterpret_cast<HDC>(wParam);
-        ApplyCtlColor(hdc, THEME_BG);
-        return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
+        ApplyCtlColor(hdc, THEME_PANEL);
+        return reinterpret_cast<LRESULT>(ThemePanelBrush());
     }
 
     case WM_DRAWITEM:
@@ -1670,6 +1869,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_app.worker.joinable()) {
             g_app.worker.join();
         }
+        if (g_app.uiFont) {
+            DeleteObject(g_app.uiFont);
+            g_app.uiFont = nullptr;
+        }
+        if (g_app.headerFont) {
+            DeleteObject(g_app.headerFont);
+            g_app.headerFont = nullptr;
+        }
+        if (g_app.titleFont) {
+            DeleteObject(g_app.titleFont);
+            g_app.titleFont = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
 
@@ -1682,7 +1893,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);
-    commonControls.dwICC = ICC_BAR_CLASSES;
+    commonControls.dwICC = ICC_BAR_CLASSES | ICC_WIN95_CLASSES;
     InitCommonControlsEx(&commonControls);
 
     WNDCLASSW previewClass{};
@@ -1712,7 +1923,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        990, 450,
+        1080, 705,
         nullptr,
         nullptr,
         hInstance,
