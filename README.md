@@ -45,3 +45,4 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc
 - `firmware/serial_hid_bridge/serial_hid_bridge.ino` - optional external USB HID bridge firmware.
 - `assets/app-logo.png` and `assets/app.ico` - app logo and executable icon.
 - `minhanbot.exe` - Windows x64 GUI build.
+- `minhanbot-standalone.exe` - same Windows build under a fresh filename for direct downloads.
