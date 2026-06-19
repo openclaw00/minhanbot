@@ -1315,9 +1315,10 @@ void CreateMainControls(HWND hwnd) {
     constexpr int leftLabelX = 16;
     constexpr int leftEditX = 190;
     constexpr int leftUnitX = 292;
-    constexpr int rightLabelX = 420;
-    constexpr int rightEditX = 560;
-    constexpr int rightUnitX = 662;
+    constexpr int rightLabelX = 450;
+    constexpr int rightEditX = 590;
+    constexpr int rightUnitX = 692;
+    constexpr int previewX = 730;
 
     CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
@@ -1407,13 +1408,13 @@ void CreateMainControls(HWND hwnd) {
     HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 3, editW, 180);
     PopulateSerialPortChoices(serialPort);
 
-    CreateLabel(hwnd, L"Live preview", 680, 16, 140, 20);
+    CreateLabel(hwnd, L"Live preview", previewX, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
                                     WS_CHILD | WS_VISIBLE,
-                                    680, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                    previewX, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
                                   WS_CHILD | WS_VISIBLE,
-                                  680, 250, 280, 24, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  previewX, 250, 300, 48, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -1635,7 +1636,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t text[128]{};
         wsprintfW(
             text,
-            L"Hits: %d/%d  Closest RGB: %d,%d,%d  RGB +/- %d",
+            L"Hits: %d/%d\r\nClosest RGB: %d,%d,%d  RGB +/- %d",
             g_app.lastHits.load(std::memory_order_relaxed),
             g_app.requiredHits.load(std::memory_order_relaxed),
             g_app.closestR.load(std::memory_order_relaxed),
@@ -1712,7 +1713,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        990, 450,
+        1100, 450,
         nullptr,
         nullptr,
         hInstance,
