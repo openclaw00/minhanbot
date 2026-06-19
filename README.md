@@ -7,8 +7,15 @@ Single-file Win32 C++ screen color monitor with a minimal native GUI.
 - Captures a small zone centered on the virtual desktop through DXGI Desktop Duplication.
 - Detects a screen-picked RGB target color with per-channel tolerance and a configurable required pixel count.
 - Sends configurable key down/up commands only to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
-- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, optional held-input gating, hold-while-visible mode, release delay, bell-curve scan interval, and a Start/Stop hotkey.
+- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, optional held-input gating, hold-while-visible mode, release delay, bell-curve scan interval, saved profiles, and a Start/Stop hotkey.
+- Shows a red/green serial status indicator for Arduino connection/write failures.
 - Shows a live zoomed preview of the monitored area.
+
+## Profiles
+
+Type a profile name, adjust the controls, then press `Save`. The app writes profiles to `minhanbot.ini` next to `minhanbot.exe` and reloads the last selected profile on startup.
+
+Choose a saved profile and press `Load` to restore its settings. `Default` always means the built-in defaults from the source code.
 
 ## External Arduino input
 
@@ -20,7 +27,7 @@ Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board t
 4. Check Device Manager for the board's COM port, for example `COM6`.
 5. In minhanbot, choose or type the COM port, then press `Apply`.
 
-The desktop app still does detection and timing. The board receives commands such as `D 4A` and `U 4A`, then performs the actual USB keyboard press/release.
+The desktop app still does detection and timing. The board receives commands such as `D 4A` and `U 4A`, then performs the actual USB keyboard press/release. The firmware releases all keys automatically if serial commands stop for more than 1.5 seconds.
 
 ## Build
 
@@ -46,3 +53,4 @@ x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -static-libgcc
 - `assets/app-logo.png` and `assets/app.ico` - app logo and executable icon.
 - `minhanbot.exe` - Windows x64 GUI build.
 - `minhanbot-standalone.exe` - same Windows build under a fresh filename for direct downloads.
+- `minhanbot.ini` - generated local profile/settings file next to the exe.

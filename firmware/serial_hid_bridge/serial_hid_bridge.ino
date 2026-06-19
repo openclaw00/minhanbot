@@ -37,6 +37,9 @@ const KeyMap SPECIAL_KEYS[] = {
   {0x7B, KEY_F12}
 };
 
+const unsigned long COMMAND_TIMEOUT_MS = 1500;
+unsigned long lastCommandAt = 0;
+
 byte keyForVirtualKey(byte vk) {
   if (vk >= 'A' && vk <= 'Z') {
     return 'a' + (vk - 'A');
@@ -70,9 +73,15 @@ int hexValue(char ch) {
 void setup() {
   Serial.begin(115200);
   Keyboard.begin();
+  lastCommandAt = millis();
 }
 
 void loop() {
+  if (millis() - lastCommandAt > COMMAND_TIMEOUT_MS) {
+    Keyboard.releaseAll();
+    lastCommandAt = millis();
+  }
+
   if (!Serial.available()) {
     return;
   }
@@ -106,4 +115,5 @@ void loop() {
   } else {
     Keyboard.release(key);
   }
+  lastCommandAt = millis();
 }

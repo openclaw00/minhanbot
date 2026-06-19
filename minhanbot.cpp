@@ -90,6 +90,7 @@ constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
 constexpr UINT WM_APP_STATS = WM_APP + 3;
 constexpr UINT WM_APP_PICKED_COLOR = WM_APP + 4;
+constexpr UINT WM_APP_SERIAL_STATUS = WM_APP + 5;
 constexpr int TOGGLE_HOTKEY_ID = 1;
 
 // Control identifiers.
@@ -121,6 +122,10 @@ constexpr int IDC_COOLDOWN_EVERY = 1026;
 constexpr int IDC_REQUIRE_HELD_INPUT = 1027;
 constexpr int IDC_HELD_INPUT_KEY = 1028;
 constexpr int IDC_TOLERANCE_VALUE = 1029;
+constexpr int IDC_PROFILE_NAME = 1030;
+constexpr int IDC_PROFILE_LOAD = 1031;
+constexpr int IDC_PROFILE_SAVE = 1032;
+constexpr int IDC_SERIAL_STATUS = 1033;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -137,6 +142,12 @@ enum class StatusKind : int {
     Disarmed,
     Armed,
     Detected
+};
+
+enum class SerialStatusKind : int {
+    Idle,
+    Connected,
+    Error
 };
 
 struct RuntimeConfig {
@@ -181,6 +192,10 @@ struct AppState {
     HWND targetColorText = nullptr;
     HWND toleranceSlider = nullptr;
     HWND toleranceValue = nullptr;
+    HWND profileName = nullptr;
+    HWND profileLoad = nullptr;
+    HWND profileSave = nullptr;
+    HWND serialStatus = nullptr;
     DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
@@ -192,6 +207,7 @@ struct AppState {
     std::atomic_int closestG{0};
     std::atomic_int closestB{0};
     std::atomic_int closestDelta{0};
+    std::atomic_int serialStatusKind{static_cast<int>(SerialStatusKind::Idle)};
     std::thread worker;
 
     std::mutex configMutex;
@@ -203,6 +219,8 @@ struct AppState {
 };
 
 AppState g_app;
+
+void PostSerialStatus(SerialStatusKind status);
 
 HBRUSH ThemeBackgroundBrush() {
     static HBRUSH brush = CreateSolidBrush(THEME_BG);
@@ -539,6 +557,7 @@ public:
 
     bool send(bool down, DWORD vk, const std::wstring& port) {
         if (!ensureOpen(port)) {
+            PostSerialStatus(SerialStatusKind::Error);
             return false;
         }
 
@@ -549,8 +568,10 @@ public:
         const DWORD length = static_cast<DWORD>(std::strlen(command));
         if (!WriteFile(handle_, command, length, &written, nullptr) || written != length) {
             close();
+            PostSerialStatus(SerialStatusKind::Error);
             return false;
         }
+        PostSerialStatus(SerialStatusKind::Connected);
         return true;
     }
 
@@ -660,6 +681,12 @@ void PostStatus(StatusKind status) {
     }
 }
 
+void PostSerialStatus(SerialStatusKind status) {
+    if (g_app.hwnd) {
+        PostMessageW(g_app.hwnd, WM_APP_SERIAL_STATUS, static_cast<WPARAM>(status), 0);
+    }
+}
+
 bool RequiredHeldInputActive(const RuntimeConfig& cfg) {
     if (!cfg.requireHeldInput) {
         return true;
@@ -678,6 +705,7 @@ void WorkerMain() {
     RuntimeConfig heldConfig;
     bool releasePending = false;
     auto releaseAt = std::chrono::steady_clock::now();
+    auto nextHeldKeyRefresh = std::chrono::steady_clock::now();
     int nonHoldPressesSinceCooldown = 0;
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
@@ -688,6 +716,7 @@ void WorkerMain() {
                 heldKey = 0;
             }
             releasePending = false;
+            nextHeldKeyRefresh = std::chrono::steady_clock::now();
             nonHoldPressesSinceCooldown = 0;
             Sleep(10);
             continue;
@@ -768,6 +797,16 @@ void WorkerMain() {
                             keyHeld = true;
                             heldKey = cfg.targetKey;
                             heldConfig = cfg;
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                        }
+                    } else if (std::chrono::steady_clock::now() >= nextHeldKeyRefresh) {
+                        if (output.down(heldConfig, heldKey)) {
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                        } else {
+                            keyHeld = false;
+                            heldKey = 0;
+                            releasePending = false;
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now();
                         }
                     }
                 } else if (keyHeld && detection.detected && !heldInputActive) {
@@ -775,6 +814,7 @@ void WorkerMain() {
                     keyHeld = false;
                     heldKey = 0;
                     releasePending = false;
+                    nextHeldKeyRefresh = std::chrono::steady_clock::now();
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 } else {
                     if (keyHeld) {
@@ -789,6 +829,7 @@ void WorkerMain() {
                             keyHeld = false;
                             heldKey = 0;
                             releasePending = false;
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now();
                         }
                     }
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
@@ -799,6 +840,7 @@ void WorkerMain() {
                     keyHeld = false;
                     heldKey = 0;
                     releasePending = false;
+                    nextHeldKeyRefresh = std::chrono::steady_clock::now();
                 }
 
                 PostStatus(StatusKind::Detected);
@@ -831,6 +873,7 @@ void WorkerMain() {
                 output.up(heldConfig, heldKey);
                 keyHeld = false;
                 heldKey = 0;
+                nextHeldKeyRefresh = std::chrono::steady_clock::now();
             }
         }
 
@@ -1048,6 +1091,220 @@ bool IsSerialPortNameValid(const std::wstring& value) {
     return true;
 }
 
+std::wstring TrimWhitespace(std::wstring value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](wchar_t ch) {
+        return iswspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](wchar_t ch) {
+        return iswspace(ch) != 0;
+    }).base();
+
+    if (first >= last) {
+        return L"";
+    }
+    return std::wstring(first, last);
+}
+
+std::wstring SettingsPath() {
+    wchar_t path[MAX_PATH]{};
+    const DWORD len = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
+    if (len == 0 || len >= sizeof(path) / sizeof(path[0])) {
+        return L"minhanbot.ini";
+    }
+
+    std::wstring result(path, path + len);
+    const std::size_t slash = result.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) {
+        return L"minhanbot.ini";
+    }
+    result.resize(slash + 1);
+    result += L"minhanbot.ini";
+    return result;
+}
+
+std::wstring ProfileSectionName(const std::wstring& profileName) {
+    return L"profile:" + profileName;
+}
+
+bool IsProfileNameValid(const std::wstring& name) {
+    if (name.empty() || name.size() > 64) {
+        return false;
+    }
+    return name.find_first_of(L"[]=;") == std::wstring::npos;
+}
+
+void WriteProfileInt(const std::wstring& path, const std::wstring& section, const wchar_t* key, int value) {
+    wchar_t text[32]{};
+    wsprintfW(text, L"%d", value);
+    WritePrivateProfileStringW(section.c_str(), key, text, path.c_str());
+}
+
+void WriteProfileBool(const std::wstring& path, const std::wstring& section, const wchar_t* key, bool value) {
+    WritePrivateProfileStringW(section.c_str(), key, value ? L"1" : L"0", path.c_str());
+}
+
+bool WriteConfigProfile(const std::wstring& profileName, const RuntimeConfig& cfg) {
+    if (!IsProfileNameValid(profileName)) {
+        return false;
+    }
+
+    const std::wstring path = SettingsPath();
+    const std::wstring section = ProfileSectionName(profileName);
+
+    WriteProfileInt(path, section, L"CaptureWidth", cfg.captureWidth);
+    WriteProfileInt(path, section, L"CaptureHeight", cfg.captureHeight);
+    WriteProfileInt(path, section, L"Tolerance", cfg.tolerance);
+    WriteProfileInt(path, section, L"MinColorPixels", cfg.minColorPixels);
+    WriteProfileInt(path, section, L"TargetColorR", cfg.targetColor.r);
+    WriteProfileInt(path, section, L"TargetColorG", cfg.targetColor.g);
+    WriteProfileInt(path, section, L"TargetColorB", cfg.targetColor.b);
+    WriteProfileInt(path, section, L"TargetKey", static_cast<int>(cfg.targetKey));
+    WriteProfileInt(path, section, L"DelayBeforePressMin", cfg.delayBeforePressMin);
+    WriteProfileInt(path, section, L"DelayBeforePressMax", cfg.delayBeforePressMax);
+    WriteProfileInt(path, section, L"KeyHoldMin", cfg.keyHoldMin);
+    WriteProfileInt(path, section, L"KeyHoldMax", cfg.keyHoldMax);
+    WriteProfileInt(path, section, L"CooldownAfterPressMin", cfg.cooldownAfterPressMin);
+    WriteProfileInt(path, section, L"CooldownAfterPressMax", cfg.cooldownAfterPressMax);
+    WriteProfileInt(path, section, L"CooldownAfterPressEvery", cfg.cooldownAfterPressEvery);
+    WriteProfileInt(path, section, L"ReleaseDelayMin", cfg.releaseDelayMin);
+    WriteProfileInt(path, section, L"ReleaseDelayMax", cfg.releaseDelayMax);
+    WriteProfileInt(path, section, L"ScanIntervalMin", cfg.scanIntervalMin);
+    WriteProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
+    WriteProfileBool(path, section, L"HoldWhileVisible", cfg.holdWhileVisible);
+    WriteProfileBool(path, section, L"RequireHeldInput", cfg.requireHeldInput);
+    WriteProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey));
+    WriteProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey));
+    WritePrivateProfileStringW(section.c_str(), L"SerialPort", cfg.serialPort.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"general", L"LastProfile", profileName.c_str(), path.c_str());
+    return true;
+}
+
+int ReadProfileInt(const std::wstring& path, const std::wstring& section, const wchar_t* key, int fallback) {
+    return static_cast<int>(GetPrivateProfileIntW(section.c_str(), key, fallback, path.c_str()));
+}
+
+bool ReadConfigProfile(const std::wstring& profileName, RuntimeConfig& cfg) {
+    cfg = RuntimeConfig{};
+    if (profileName == L"Default") {
+        return true;
+    }
+    if (!IsProfileNameValid(profileName)) {
+        return false;
+    }
+
+    const std::wstring path = SettingsPath();
+    const std::wstring section = ProfileSectionName(profileName);
+    wchar_t probe[8]{};
+    if (GetPrivateProfileStringW(section.c_str(), L"CaptureWidth", L"", probe, static_cast<DWORD>(sizeof(probe) / sizeof(probe[0])), path.c_str()) == 0) {
+        return false;
+    }
+
+    cfg.captureWidth = ReadProfileInt(path, section, L"CaptureWidth", cfg.captureWidth);
+    cfg.captureHeight = ReadProfileInt(path, section, L"CaptureHeight", cfg.captureHeight);
+    cfg.tolerance = ReadProfileInt(path, section, L"Tolerance", cfg.tolerance);
+    cfg.minColorPixels = ReadProfileInt(path, section, L"MinColorPixels", cfg.minColorPixels);
+    cfg.targetColor.r = ReadProfileInt(path, section, L"TargetColorR", cfg.targetColor.r);
+    cfg.targetColor.g = ReadProfileInt(path, section, L"TargetColorG", cfg.targetColor.g);
+    cfg.targetColor.b = ReadProfileInt(path, section, L"TargetColorB", cfg.targetColor.b);
+    cfg.targetKey = static_cast<DWORD>(ReadProfileInt(path, section, L"TargetKey", static_cast<int>(cfg.targetKey)));
+    cfg.delayBeforePressMin = ReadProfileInt(path, section, L"DelayBeforePressMin", cfg.delayBeforePressMin);
+    cfg.delayBeforePressMax = ReadProfileInt(path, section, L"DelayBeforePressMax", cfg.delayBeforePressMax);
+    cfg.keyHoldMin = ReadProfileInt(path, section, L"KeyHoldMin", cfg.keyHoldMin);
+    cfg.keyHoldMax = ReadProfileInt(path, section, L"KeyHoldMax", cfg.keyHoldMax);
+    cfg.cooldownAfterPressMin = ReadProfileInt(path, section, L"CooldownAfterPressMin", cfg.cooldownAfterPressMin);
+    cfg.cooldownAfterPressMax = ReadProfileInt(path, section, L"CooldownAfterPressMax", cfg.cooldownAfterPressMax);
+    cfg.cooldownAfterPressEvery = ReadProfileInt(path, section, L"CooldownAfterPressEvery", cfg.cooldownAfterPressEvery);
+    cfg.releaseDelayMin = ReadProfileInt(path, section, L"ReleaseDelayMin", cfg.releaseDelayMin);
+    cfg.releaseDelayMax = ReadProfileInt(path, section, L"ReleaseDelayMax", cfg.releaseDelayMax);
+    cfg.scanIntervalMin = ReadProfileInt(path, section, L"ScanIntervalMin", cfg.scanIntervalMin);
+    cfg.scanIntervalMax = ReadProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
+    cfg.holdWhileVisible = ReadProfileInt(path, section, L"HoldWhileVisible", cfg.holdWhileVisible ? 1 : 0) != 0;
+    cfg.requireHeldInput = ReadProfileInt(path, section, L"RequireHeldInput", cfg.requireHeldInput ? 1 : 0) != 0;
+    cfg.heldInputKey = static_cast<DWORD>(ReadProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey)));
+    cfg.toggleHotkey = static_cast<DWORD>(ReadProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey)));
+
+    wchar_t serialPort[32]{};
+    GetPrivateProfileStringW(section.c_str(), L"SerialPort", cfg.serialPort.c_str(), serialPort, static_cast<DWORD>(sizeof(serialPort) / sizeof(serialPort[0])), path.c_str());
+    cfg.serialPort = TrimUpper(serialPort);
+    return true;
+}
+
+std::wstring LastProfileName() {
+    wchar_t profile[80]{};
+    const std::wstring path = SettingsPath();
+    GetPrivateProfileStringW(L"general", L"LastProfile", L"Default", profile, static_cast<DWORD>(sizeof(profile) / sizeof(profile[0])), path.c_str());
+    std::wstring name = TrimWhitespace(profile);
+    return name.empty() ? L"Default" : name;
+}
+
+bool ComboHasString(HWND combo, const std::wstring& text) {
+    return SendMessageW(combo, CB_FINDSTRINGEXACT, static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(text.c_str())) != CB_ERR;
+}
+
+void AddProfileChoice(HWND combo, const std::wstring& name) {
+    if (!ComboHasString(combo, name)) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
+    }
+}
+
+void RefreshProfileChoices(HWND combo) {
+    if (!combo) {
+        return;
+    }
+
+    const std::wstring current = TrimWhitespace(GetWindowTextString(combo));
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    AddProfileChoice(combo, L"Default");
+
+    const std::wstring path = SettingsPath();
+    std::vector<wchar_t> sections(8192, L'\0');
+    const DWORD length = GetPrivateProfileSectionNamesW(sections.data(), static_cast<DWORD>(sections.size()), path.c_str());
+    if (length > 0) {
+        for (const wchar_t* section = sections.data(); *section != L'\0'; section += wcslen(section) + 1) {
+            const std::wstring sectionName(section);
+            const std::wstring prefix = L"profile:";
+            if (sectionName.rfind(prefix, 0) == 0) {
+                const std::wstring profileName = sectionName.substr(prefix.size());
+                if (IsProfileNameValid(profileName)) {
+                    AddProfileChoice(combo, profileName);
+                }
+            }
+        }
+    }
+
+    SetWindowTextW(combo, current.empty() ? L"Default" : current.c_str());
+}
+
+std::wstring SelectedProfileName(HWND hwnd) {
+    return TrimWhitespace(GetWindowTextString(GetDlgItem(hwnd, IDC_PROFILE_NAME)));
+}
+
+void SetControlsFromConfig(HWND hwnd, const RuntimeConfig& cfg) {
+    SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
+    SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
+    SetToleranceSliderValue(cfg.tolerance);
+    SetControlInt(hwnd, IDC_MIN_COLOR_PIXELS, cfg.minColorPixels);
+    g_app.selectedTargetColor = cfg.targetColor;
+    SetTargetColorText(hwnd, cfg.targetColor);
+    SetControlKeyName(hwnd, IDC_KEY, cfg.targetKey);
+    SetControlInt(hwnd, IDC_PRE_MIN, cfg.delayBeforePressMin);
+    SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
+    SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
+    SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
+    SetControlInt(hwnd, IDC_COOLDOWN_MIN, cfg.cooldownAfterPressMin);
+    SetControlInt(hwnd, IDC_COOLDOWN_MAX, cfg.cooldownAfterPressMax);
+    SetControlInt(hwnd, IDC_COOLDOWN_EVERY, cfg.cooldownAfterPressEvery);
+    SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
+    SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
+    SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
+    SetControlInt(hwnd, IDC_SCAN_MAX, cfg.scanIntervalMax);
+    SetControlKeyName(hwnd, IDC_HELD_INPUT_KEY, cfg.heldInputKey);
+    SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
+    SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
+    CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
+}
+
 bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) {
     RuntimeConfig next{};
 
@@ -1219,30 +1476,16 @@ void EnableDarkTitleBar(HWND hwnd) {
 }
 
 void PopulateDefaults(HWND hwnd) {
-    const RuntimeConfig cfg{};
-    SetControlInt(hwnd, IDC_WIDTH, cfg.captureWidth);
-    SetControlInt(hwnd, IDC_HEIGHT, cfg.captureHeight);
-    SetToleranceSliderValue(cfg.tolerance);
-    SetControlInt(hwnd, IDC_MIN_COLOR_PIXELS, cfg.minColorPixels);
-    g_app.selectedTargetColor = cfg.targetColor;
-    SetTargetColorText(hwnd, cfg.targetColor);
-    SetControlKeyName(hwnd, IDC_KEY, cfg.targetKey);
-    SetControlInt(hwnd, IDC_PRE_MIN, cfg.delayBeforePressMin);
-    SetControlInt(hwnd, IDC_PRE_MAX, cfg.delayBeforePressMax);
-    SetControlInt(hwnd, IDC_HOLD_MIN, cfg.keyHoldMin);
-    SetControlInt(hwnd, IDC_HOLD_MAX, cfg.keyHoldMax);
-    SetControlInt(hwnd, IDC_COOLDOWN_MIN, cfg.cooldownAfterPressMin);
-    SetControlInt(hwnd, IDC_COOLDOWN_MAX, cfg.cooldownAfterPressMax);
-    SetControlInt(hwnd, IDC_COOLDOWN_EVERY, cfg.cooldownAfterPressEvery);
-    SetControlInt(hwnd, IDC_RELEASE_MIN, cfg.releaseDelayMin);
-    SetControlInt(hwnd, IDC_RELEASE_MAX, cfg.releaseDelayMax);
-    SetControlInt(hwnd, IDC_SCAN_MIN, cfg.scanIntervalMin);
-    SetControlInt(hwnd, IDC_SCAN_MAX, cfg.scanIntervalMax);
-    SetControlKeyName(hwnd, IDC_HELD_INPUT_KEY, cfg.heldInputKey);
-    SetControlKeyName(hwnd, IDC_TOGGLE_HOTKEY, cfg.toggleHotkey);
-    SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
-    CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
+    RuntimeConfig cfg{};
+    std::wstring profileName = LastProfileName();
+    if (!ReadConfigProfile(profileName, cfg)) {
+        profileName = L"Default";
+        cfg = RuntimeConfig{};
+    }
+
+    RefreshProfileChoices(GetDlgItem(hwnd, IDC_PROFILE_NAME));
+    SetWindowTextW(GetDlgItem(hwnd, IDC_PROFILE_NAME), profileName.c_str());
+    SetControlsFromConfig(hwnd, cfg);
 }
 
 void DrawPreview(HWND hwnd, HDC hdc) {
@@ -1305,6 +1548,11 @@ void CreateMainControls(HWND hwnd) {
     g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                    430, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+
+    CreateLabel(hwnd, L"Profile", 600, 21, 54, 20);
+    g_app.profileName = CreateCombo(hwnd, IDC_PROFILE_NAME, 656, 16, 130, 160);
+    g_app.profileLoad = CreateButton(hwnd, IDC_PROFILE_LOAD, L"Load", 798, 16, 64, 30);
+    g_app.profileSave = CreateButton(hwnd, IDC_PROFILE_SAVE, L"Save", 872, 16, 64, 30);
 
     int y = 66;
     constexpr int labelW = 170;
@@ -1407,6 +1655,10 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"Arduino COM port", rightLabelX, y, labelW, rowH);
     HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 3, editW, 180);
     PopulateSerialPortChoices(serialPort);
+    g_app.serialStatus = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Serial: idle",
+                                         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_CENTER,
+                                         rightUnitX, y - 3, 128, rowH,
+                                         hwnd, reinterpret_cast<HMENU>(IDC_SERIAL_STATUS), GetModuleHandleW(nullptr), nullptr);
 
     CreateLabel(hwnd, L"Live preview", previewX, 16, 140, 20);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
@@ -1502,6 +1754,47 @@ bool ApplyConfig(HWND hwnd) {
     return true;
 }
 
+void LoadSelectedProfile(HWND hwnd) {
+    const std::wstring profileName = SelectedProfileName(hwnd);
+    RuntimeConfig cfg;
+    if (!ReadConfigProfile(profileName, cfg)) {
+        MessageBoxW(hwnd, L"That profile does not exist yet.", L"Profile not found", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    SetControlsFromConfig(hwnd, cfg);
+    if (ApplyConfig(hwnd)) {
+        WritePrivateProfileStringW(L"general", L"LastProfile", profileName.c_str(), SettingsPath().c_str());
+    }
+    PostSerialStatus(SerialStatusKind::Idle);
+}
+
+void SaveSelectedProfile(HWND hwnd) {
+    const std::wstring profileName = SelectedProfileName(hwnd);
+    if (!IsProfileNameValid(profileName) || profileName == L"Default") {
+        MessageBoxW(hwnd, L"Type a custom profile name before saving.", L"Invalid profile name", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    if (!ApplyConfig(hwnd)) {
+        return;
+    }
+
+    RuntimeConfig cfg;
+    {
+        std::lock_guard<std::mutex> lock(g_app.configMutex);
+        cfg = g_app.config;
+    }
+
+    if (!WriteConfigProfile(profileName, cfg)) {
+        MessageBoxW(hwnd, L"Could not save that profile.", L"Profile save failed", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    RefreshProfileChoices(GetDlgItem(hwnd, IDC_PROFILE_NAME));
+    SetWindowTextW(GetDlgItem(hwnd, IDC_PROFILE_NAME), profileName.c_str());
+}
+
 void StartMonitoring(HWND hwnd) {
     if (!ApplyConfig(hwnd)) {
         return;
@@ -1556,6 +1849,12 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_APPLY:
             ApplyConfig(hwnd);
             return 0;
+        case IDC_PROFILE_LOAD:
+            LoadSelectedProfile(hwnd);
+            return 0;
+        case IDC_PROFILE_SAVE:
+            SaveSelectedProfile(hwnd);
+            return 0;
         case IDC_PICK_COLOR:
             StartScreenColorPick(hwnd);
             return 0;
@@ -1570,6 +1869,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int id = GetDlgCtrlID(child);
         if (id == IDC_STATUS || id == IDC_TARGET_COLOR) {
             ApplyCtlColor(hdc, THEME_PANEL);
+            return reinterpret_cast<LRESULT>(ThemePanelBrush());
+        }
+        if (id == IDC_SERIAL_STATUS) {
+            const SerialStatusKind serialStatus = static_cast<SerialStatusKind>(
+                g_app.serialStatusKind.load(std::memory_order_relaxed));
+            COLORREF fg = THEME_MUTED;
+            if (serialStatus == SerialStatusKind::Connected) {
+                fg = RGB(85, 230, 120);
+            } else if (serialStatus == SerialStatusKind::Error) {
+                fg = RGB(255, 90, 90);
+            }
+            ApplyCtlColor(hdc, THEME_PANEL, fg);
             return reinterpret_cast<LRESULT>(ThemePanelBrush());
         }
         ApplyCtlColor(hdc, THEME_BG, THEME_MUTED);
@@ -1656,6 +1967,27 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetSelectedTargetColor(hwnd, static_cast<COLORREF>(wParam));
         }
         return 0;
+
+    case WM_APP_SERIAL_STATUS: {
+        const SerialStatusKind serialStatus = static_cast<SerialStatusKind>(wParam);
+        g_app.serialStatusKind.store(static_cast<int>(serialStatus), std::memory_order_relaxed);
+        if (g_app.serialStatus) {
+            switch (serialStatus) {
+            case SerialStatusKind::Connected:
+                SetWindowTextW(g_app.serialStatus, L"Serial: connected");
+                break;
+            case SerialStatusKind::Error:
+                SetWindowTextW(g_app.serialStatus, L"Serial: error");
+                break;
+            case SerialStatusKind::Idle:
+            default:
+                SetWindowTextW(g_app.serialStatus, L"Serial: idle");
+                break;
+            }
+            InvalidateRect(g_app.serialStatus, nullptr, TRUE);
+        }
+        return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
