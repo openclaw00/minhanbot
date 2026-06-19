@@ -69,8 +69,8 @@ struct RGB_COLOR {
 };
 
 // Humanization / cadence jitter timing (milliseconds).
-constexpr int DELAY_BEFORE_PRESS_MIN = 20;
-constexpr int DELAY_BEFORE_PRESS_MAX = 50;
+constexpr int DELAY_BEFORE_PRESS_MIN = 5;
+constexpr int DELAY_BEFORE_PRESS_MAX = 25;
 constexpr int KEY_HOLD_MIN = 20;
 constexpr int KEY_HOLD_MAX = 100;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
@@ -157,7 +157,7 @@ struct RuntimeConfig {
     int releaseDelayMax = RELEASE_DELAY_MAX;
     int scanIntervalMin = SCAN_INTERVAL_MIN;
     int scanIntervalMax = SCAN_INTERVAL_MAX;
-    bool holdWhileVisible = true;
+    bool holdWhileVisible = false;
     bool requireHeldInput = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
