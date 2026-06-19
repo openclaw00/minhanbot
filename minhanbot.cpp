@@ -1307,7 +1307,7 @@ void CreateMainControls(HWND hwnd) {
                                    430, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
 
     int y = 66;
-    constexpr int labelW = 150;
+    constexpr int labelW = 170;
     constexpr int editW = 90;
     constexpr int smallEditW = 70;
     constexpr int rowH = 24;
@@ -1315,10 +1315,10 @@ void CreateMainControls(HWND hwnd) {
     constexpr int leftLabelX = 16;
     constexpr int leftEditX = 190;
     constexpr int leftUnitX = 292;
-    constexpr int rightLabelX = 450;
-    constexpr int rightEditX = 590;
-    constexpr int rightUnitX = 692;
-    constexpr int previewX = 730;
+    constexpr int rightLabelX = 520;
+    constexpr int rightEditX = 710;
+    constexpr int rightUnitX = 812;
+    constexpr int previewX = 1000;
 
     CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
@@ -1413,8 +1413,8 @@ void CreateMainControls(HWND hwnd) {
                                     WS_CHILD | WS_VISIBLE,
                                     previewX, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
-                                  WS_CHILD | WS_VISIBLE,
-                                  previewX, 250, 300, 48, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                  previewX, 268, 340, 56, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -1636,7 +1636,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t text[128]{};
         wsprintfW(
             text,
-            L"Hits: %d/%d\r\nClosest RGB: %d,%d,%d  RGB +/- %d",
+            L"Hits: %d/%d\nClosest RGB: %d,%d,%d  RGB +/- %d",
             g_app.lastHits.load(std::memory_order_relaxed),
             g_app.requiredHits.load(std::memory_order_relaxed),
             g_app.closestR.load(std::memory_order_relaxed),
@@ -1713,7 +1713,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1100, 450,
+        1400, 450,
         nullptr,
         nullptr,
         hInstance,
