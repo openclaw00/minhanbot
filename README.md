@@ -24,7 +24,7 @@ Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board t
 1. Open `firmware/serial_hid_bridge/serial_hid_bridge.ino` in the Arduino IDE.
 2. Select the board and upload the sketch.
 3. Plug the board into the Windows machine running `minhanbot.exe`.
-4. Check Device Manager for the board's COM port, for example `COM6`.
+4. Check Device Manager for the board's COM port, for example `COM3`.
 5. In minhanbot, choose or type the COM port, then press `Apply`.
 
 The desktop app still does detection and timing. The board receives commands such as `D 4A` and `U 4A`, then performs the actual USB keyboard press/release. The firmware releases all keys automatically if serial commands stop for more than 1.5 seconds.

@@ -71,8 +71,8 @@ struct RGB_COLOR {
 // Humanization / cadence jitter timing (milliseconds).
 constexpr int DELAY_BEFORE_PRESS_MIN = 5;
 constexpr int DELAY_BEFORE_PRESS_MAX = 25;
-constexpr int KEY_HOLD_MIN = 20;
-constexpr int KEY_HOLD_MAX = 100;
+constexpr int KEY_HOLD_MIN = 4;
+constexpr int KEY_HOLD_MAX = 30;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
 constexpr int COOLDOWN_AFTER_PRESS_MAX = 0;
 constexpr int COOLDOWN_AFTER_PRESS_EVERY = 1;
@@ -172,7 +172,7 @@ struct RuntimeConfig {
     bool requireHeldInput = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
-    std::wstring serialPort = L"COM6";
+    std::wstring serialPort = L"COM3";
 };
 
 struct FrameBuffer {
@@ -1360,7 +1360,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
-        error = L"External Arduino input needs a COM port like COM6.";
+        error = L"External Arduino input needs a COM port like COM3.";
         return false;
     }
 
