@@ -3,7 +3,7 @@
 
     Build from a "Developer Command Prompt for VS":
         rc minhanbot.rc
-        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comctl32.lib d3d11.lib dxgi.lib /link /SUBSYSTEM:WINDOWS
+        cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE /Fe:minhanbot.exe minhanbot.cpp minhanbot.res user32.lib gdi32.lib comctl32.lib d3d11.lib dxgi.lib runtimeobject.lib /link /SUBSYSTEM:WINDOWS
 
     How to adjust:
         - Defaults are in the CONFIGURATION section below.
@@ -21,8 +21,8 @@
     Notes:
         - Key commands are sent only to an external serial USB HID bridge.
         - Compile as a Windows subsystem application; no console window is used.
-        - DXGI Desktop Duplication is used to capture the output containing the center of the
-          virtual desktop, then a small centered region is copied into a CPU-readable texture.
+        - Windows Graphics Capture captures the monitor containing the center of the virtual
+          desktop, then a small centered region is copied into a CPU-readable texture.
 */
 
 #ifndef UNICODE
@@ -36,6 +36,16 @@
 #include <commctrl.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <roapi.h>
+// Current MinGW headers emit duplicate C++ specializations for BYTE and WinRT boolean.
+// The capture interfaces do not use IReference<BYTE>, so suppress that unused definition.
+#if defined(__MINGW32__)
+#define ____FIReference_1_BYTE_INTERFACE_DEFINED__
+#endif
+#include <windows.foundation.h>
+#include <windows.graphics.capture.h>
+#include <windows.graphics.capture.interop.h>
+#include <winstring.h>
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +61,32 @@
 #include <thread>
 #include <cwctype>
 #include <vector>
+
+// MinGW does not currently ship this small Windows Graphics Capture interop header.
+MIDL_INTERFACE("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")
+IDirect3DDxgiInterfaceAccess : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetInterface(REFIID iid, void** object) = 0;
+};
+constexpr IID IID_IDirect3DDxgiInterfaceAccess = {
+    0xA9B3D012, 0x3DF2, 0x4EE3, {0xB8, 0xD1, 0x86, 0x95, 0xF4, 0x57, 0xD3, 0xC1}};
+
+using CreateDirect3D11DeviceFromDXGIDeviceFn = HRESULT (WINAPI*)(IDXGIDevice*, IInspectable**);
+
+void CloseWinRtObject(IUnknown* object) {
+    if (!object) {
+        return;
+    }
+    ABI::Windows::Foundation::IClosable* closable = nullptr;
+    if (SUCCEEDED(object->QueryInterface(
+            __uuidof(ABI::Windows::Foundation::IClosable),
+            reinterpret_cast<void**>(&closable))) && closable) {
+        closable->Close();
+    }
+    if (closable) {
+        closable->Release();
+    }
+}
 
 // === CONFIGURATION ===
 constexpr int CAPTURE_WIDTH = 15;
@@ -266,11 +302,17 @@ public:
     }
 
     bool ensure(int width, int height) {
-        if (width == width_ && height == height_ && duplication_ && staging_ && !bgra_.empty()) {
+        if (width == width_ && height == height_ && framePool_ && session_ && staging_ && !bgra_.empty()) {
             return true;
         }
 
         reset();
+
+        const HRESULT initHr = RoInitialize(RO_INIT_MULTITHREADED);
+        if (FAILED(initHr) && initHr != RPC_E_CHANGED_MODE) {
+            return false;
+        }
+        roInitialized_ = SUCCEEDED(initHr);
 
         HRESULT hr = D3D11CreateDevice(
             nullptr,
@@ -288,13 +330,8 @@ public:
         }
 
         IDXGIDevice* dxgiDevice = nullptr;
-        IDXGIAdapter* adapter = nullptr;
         hr = device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
-        if (SUCCEEDED(hr)) {
-            hr = dxgiDevice->GetAdapter(&adapter);
-        }
-        SafeRelease(dxgiDevice);
-        if (FAILED(hr) || !adapter) {
+        if (FAILED(hr) || !dxgiDevice) {
             reset();
             return false;
         }
@@ -305,53 +342,99 @@ public:
         const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         const int centerX = vx + vw / 2;
         const int centerY = vy + vh / 2;
-
-        IDXGIOutput* selectedOutput = nullptr;
-        DXGI_OUTPUT_DESC selectedDesc{};
-        for (UINT index = 0; ; ++index) {
-            IDXGIOutput* output = nullptr;
-            if (adapter->EnumOutputs(index, &output) == DXGI_ERROR_NOT_FOUND) {
-                break;
-            }
-
-            DXGI_OUTPUT_DESC desc{};
-            if (output && SUCCEEDED(output->GetDesc(&desc))) {
-                const RECT& rc = desc.DesktopCoordinates;
-                if (centerX >= rc.left && centerX < rc.right && centerY >= rc.top && centerY < rc.bottom) {
-                    selectedOutput = output;
-                    selectedDesc = desc;
-                    break;
-                }
-            }
-            SafeRelease(output);
-        }
-        SafeRelease(adapter);
-
-        if (!selectedOutput) {
+        const POINT centerPoint{centerX, centerY};
+        const HMONITOR monitor = MonitorFromPoint(centerPoint, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
+            SafeRelease(dxgiDevice);
             reset();
             return false;
         }
 
-        IDXGIOutput1* output1 = nullptr;
-        hr = selectedOutput->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
-        SafeRelease(selectedOutput);
-        if (FAILED(hr) || !output1) {
+        HMODULE d3d11Module = GetModuleHandleW(L"d3d11.dll");
+        const auto createWinRtDevice = d3d11Module
+            ? reinterpret_cast<CreateDirect3D11DeviceFromDXGIDeviceFn>(
+                  GetProcAddress(d3d11Module, "CreateDirect3D11DeviceFromDXGIDevice"))
+            : nullptr;
+        if (!createWinRtDevice) {
+            SafeRelease(dxgiDevice);
             reset();
             return false;
         }
 
-        hr = output1->DuplicateOutput(device_, &duplication_);
-        SafeRelease(output1);
+        IInspectable* direct3DDeviceInspectable = nullptr;
+        hr = createWinRtDevice(dxgiDevice, &direct3DDeviceInspectable);
+        SafeRelease(dxgiDevice);
+        if (SUCCEEDED(hr) && direct3DDeviceInspectable) {
+            hr = direct3DDeviceInspectable->QueryInterface(
+                __uuidof(ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice),
+                reinterpret_cast<void**>(&direct3DDevice_));
+        }
+        SafeRelease(direct3DDeviceInspectable);
         if (FAILED(hr)) {
             reset();
             return false;
         }
 
-        outputLeft_ = selectedDesc.DesktopCoordinates.left;
-        outputTop_ = selectedDesc.DesktopCoordinates.top;
-        outputWidth_ = selectedDesc.DesktopCoordinates.right - selectedDesc.DesktopCoordinates.left;
-        outputHeight_ = selectedDesc.DesktopCoordinates.bottom - selectedDesc.DesktopCoordinates.top;
+        outputLeft_ = monitorInfo.rcMonitor.left;
+        outputTop_ = monitorInfo.rcMonitor.top;
+        outputWidth_ = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+        outputHeight_ = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
         if (width > outputWidth_ || height > outputHeight_) {
+            reset();
+            return false;
+        }
+
+        HSTRING itemClass = nullptr;
+        WindowsCreateString(
+            L"Windows.Graphics.Capture.GraphicsCaptureItem",
+            static_cast<UINT32>(wcslen(L"Windows.Graphics.Capture.GraphicsCaptureItem")),
+            &itemClass);
+        IGraphicsCaptureItemInterop* itemInterop = nullptr;
+        hr = RoGetActivationFactory(itemClass, __uuidof(IGraphicsCaptureItemInterop),
+            reinterpret_cast<void**>(&itemInterop));
+        WindowsDeleteString(itemClass);
+        if (SUCCEEDED(hr) && itemInterop) {
+            hr = itemInterop->CreateForMonitor(
+                monitor,
+                __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureItem),
+                reinterpret_cast<void**>(&captureItem_));
+        }
+        SafeRelease(itemInterop);
+        if (FAILED(hr) || !captureItem_) {
+            reset();
+            return false;
+        }
+
+        HSTRING poolClass = nullptr;
+        WindowsCreateString(
+            L"Windows.Graphics.Capture.Direct3D11CaptureFramePool",
+            static_cast<UINT32>(wcslen(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool")),
+            &poolClass);
+        ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2* poolStatics = nullptr;
+        hr = RoGetActivationFactory(
+            poolClass,
+            __uuidof(ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2),
+            reinterpret_cast<void**>(&poolStatics));
+        WindowsDeleteString(poolClass);
+        if (SUCCEEDED(hr) && poolStatics) {
+            const ABI::Windows::Graphics::SizeInt32 size{outputWidth_, outputHeight_};
+            hr = poolStatics->CreateFreeThreaded(
+                direct3DDevice_,
+                ABI::Windows::Graphics::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+                2,
+                size,
+                &framePool_);
+        }
+        SafeRelease(poolStatics);
+        if (FAILED(hr) || !framePool_) {
+            reset();
+            return false;
+        }
+
+        hr = framePool_->CreateCaptureSession(captureItem_, &session_);
+        if (FAILED(hr) || !session_ || FAILED(session_->StartCapture())) {
             reset();
             return false;
         }
@@ -379,7 +462,7 @@ public:
     }
 
     bool captureCentered() {
-        if (!duplication_ || !context_ || !staging_) {
+        if (!framePool_ || !context_ || !staging_) {
             return false;
         }
 
@@ -392,25 +475,30 @@ public:
         const int localX = ClampInt(desiredX - outputLeft_, 0, outputWidth_ - width_);
         const int localY = ClampInt(desiredY - outputTop_, 0, outputHeight_ - height_);
 
-        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
-        IDXGIResource* frameResource = nullptr;
-        HRESULT hr = duplication_->AcquireNextFrame(0, &frameInfo, &frameResource);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            return !bgra_.empty();
-        }
-        if (hr == DXGI_ERROR_ACCESS_LOST) {
-            reset();
-            return false;
-        }
-        if (FAILED(hr) || !frameResource) {
+        ABI::Windows::Graphics::Capture::IDirect3D11CaptureFrame* frame = nullptr;
+        HRESULT hr = framePool_->TryGetNextFrame(&frame);
+        if (FAILED(hr) || !frame) {
+            // No fresh frame means no detection. Never scan stale pixels.
             return false;
         }
 
+        ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface* surface = nullptr;
+        hr = frame->get_Surface(&surface);
+        IDirect3DDxgiInterfaceAccess* surfaceAccess = nullptr;
+        if (SUCCEEDED(hr) && surface) {
+            hr = surface->QueryInterface(IID_IDirect3DDxgiInterfaceAccess,
+                reinterpret_cast<void**>(&surfaceAccess));
+        }
         ID3D11Texture2D* frameTexture = nullptr;
-        hr = frameResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&frameTexture));
-        SafeRelease(frameResource);
+        if (SUCCEEDED(hr) && surfaceAccess) {
+            hr = surfaceAccess->GetInterface(__uuidof(ID3D11Texture2D),
+                reinterpret_cast<void**>(&frameTexture));
+        }
+        SafeRelease(surfaceAccess);
+        SafeRelease(surface);
         if (FAILED(hr) || !frameTexture) {
-            duplication_->ReleaseFrame();
+            CloseWinRtObject(frame);
+            SafeRelease(frame);
             return false;
         }
 
@@ -438,7 +526,8 @@ public:
             context_->Unmap(staging_, 0);
         }
 
-        duplication_->ReleaseFrame();
+        CloseWinRtObject(frame);
+        SafeRelease(frame);
         return SUCCEEDED(hr);
     }
 
@@ -461,7 +550,12 @@ public:
 private:
     void reset() {
         SafeRelease(staging_);
-        SafeRelease(duplication_);
+        CloseWinRtObject(session_);
+        SafeRelease(session_);
+        CloseWinRtObject(framePool_);
+        SafeRelease(framePool_);
+        SafeRelease(captureItem_);
+        SafeRelease(direct3DDevice_);
         SafeRelease(context_);
         SafeRelease(device_);
         bgra_.clear();
@@ -471,11 +565,18 @@ private:
         outputTop_ = 0;
         outputWidth_ = 0;
         outputHeight_ = 0;
+        if (roInitialized_) {
+            RoUninitialize();
+            roInitialized_ = false;
+        }
     }
 
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
-    IDXGIOutputDuplication* duplication_ = nullptr;
+    ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice* direct3DDevice_ = nullptr;
+    ABI::Windows::Graphics::Capture::IGraphicsCaptureItem* captureItem_ = nullptr;
+    ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool* framePool_ = nullptr;
+    ABI::Windows::Graphics::Capture::IGraphicsCaptureSession* session_ = nullptr;
     ID3D11Texture2D* staging_ = nullptr;
     std::vector<std::uint8_t> bgra_;
     int width_ = 0;
@@ -484,6 +585,7 @@ private:
     int outputTop_ = 0;
     int outputWidth_ = 0;
     int outputHeight_ = 0;
+    bool roInitialized_ = false;
 };
 
 int SampleBellCurveMs(std::mt19937& rng, int minMs, int maxMs) {
