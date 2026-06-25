@@ -434,7 +434,21 @@ public:
         }
 
         hr = framePool_->CreateCaptureSession(captureItem_, &session_);
-        if (FAILED(hr) || !session_ || FAILED(session_->StartCapture())) {
+        if (FAILED(hr) || !session_) {
+            reset();
+            return false;
+        }
+
+        // Ask Windows Graphics Capture not to draw the colored capture border.
+        ABI::Windows::Graphics::Capture::IGraphicsCaptureSession3* session3 = nullptr;
+        if (SUCCEEDED(session_->QueryInterface(
+                __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureSession3),
+                reinterpret_cast<void**>(&session3))) && session3) {
+            session3->put_IsBorderRequired(false);
+        }
+        SafeRelease(session3);
+
+        if (FAILED(session_->StartCapture())) {
             reset();
             return false;
         }
