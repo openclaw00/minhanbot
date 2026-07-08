@@ -19,6 +19,8 @@ Type a profile name, adjust the controls, then press `Save`. The app writes prof
 
 Choose a saved profile and press `Load` to restore its settings. `Default` always means the built-in defaults from the source code.
 
+Built-in defaults include a 25 px by 20 px capture area and a 1-10 ms bell-curve delay before pressing the key.
+
 ## External Arduino input
 
 Use an Arduino Leonardo, Arduino Micro, Pro Micro, or another ATmega32u4 board that supports the Arduino `Keyboard` library.

@@ -89,8 +89,8 @@ void CloseWinRtObject(IUnknown* object) {
 }
 
 // === CONFIGURATION ===
-constexpr int CAPTURE_WIDTH = 15;
-constexpr int CAPTURE_HEIGHT = 15;
+constexpr int CAPTURE_WIDTH = 25;
+constexpr int CAPTURE_HEIGHT = 20;
 constexpr int COLOR_TOLERANCE = 40;
 constexpr int MIN_COLOR_PIXELS = 2;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
@@ -105,8 +105,8 @@ struct RGB_COLOR {
 };
 
 // Humanization / cadence jitter timing (milliseconds).
-constexpr int DELAY_BEFORE_PRESS_MIN = 5;
-constexpr int DELAY_BEFORE_PRESS_MAX = 25;
+constexpr int DELAY_BEFORE_PRESS_MIN = 1;
+constexpr int DELAY_BEFORE_PRESS_MAX = 10;
 constexpr int KEY_HOLD_MIN = 4;
 constexpr int KEY_HOLD_MAX = 30;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
