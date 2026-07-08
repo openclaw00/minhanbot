@@ -162,6 +162,7 @@ constexpr int IDC_PROFILE_NAME = 1030;
 constexpr int IDC_PROFILE_LOAD = 1031;
 constexpr int IDC_PROFILE_SAVE = 1032;
 constexpr int IDC_SERIAL_STATUS = 1033;
+constexpr int IDC_BLOCK_LEFT_CLICK = 1034;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -206,6 +207,7 @@ struct RuntimeConfig {
     int scanIntervalMax = SCAN_INTERVAL_MAX;
     bool holdWhileVisible = false;
     bool requireHeldInput = false;
+    bool blockWhileLeftClickHeld = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
     std::wstring serialPort = L"COM3";
@@ -810,6 +812,11 @@ bool RequiredHeldInputActive(const RuntimeConfig& cfg) {
     return (GetAsyncKeyState(static_cast<int>(cfg.heldInputKey)) & 0x8000) != 0;
 }
 
+bool LeftClickBlockActive(const RuntimeConfig& cfg) {
+    return cfg.blockWhileLeftClickHeld &&
+           (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+}
+
 void WorkerMain() {
     ScreenCapture capture;
     KeyOutput output;
@@ -886,10 +893,11 @@ void WorkerMain() {
             }
 
             const bool heldInputActive = RequiredHeldInputActive(cfg);
+            const bool leftClickBlocked = LeftClickBlockActive(cfg);
 
             if (cfg.holdWhileVisible) {
                 nonHoldPressesSinceCooldown = 0;
-                if (detection.detected && heldInputActive) {
+                if (detection.detected && heldInputActive && !leftClickBlocked) {
                     PostStatus(StatusKind::Detected);
                     releasePending = false;
 
@@ -909,6 +917,7 @@ void WorkerMain() {
                         if (g_app.armed.load(std::memory_order_relaxed) &&
                             !g_app.shuttingDown.load(std::memory_order_relaxed) &&
                             RequiredHeldInputActive(cfg) &&
+                            !LeftClickBlockActive(cfg) &&
                             output.down(cfg, cfg.targetKey)) {
                             keyHeld = true;
                             heldKey = cfg.targetKey;
@@ -925,7 +934,7 @@ void WorkerMain() {
                             nextHeldKeyRefresh = std::chrono::steady_clock::now();
                         }
                     }
-                } else if (keyHeld && detection.detected && !heldInputActive) {
+                } else if (keyHeld && (!heldInputActive || leftClickBlocked)) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
                     heldKey = 0;
@@ -950,7 +959,7 @@ void WorkerMain() {
                     }
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 }
-            } else if (detection.detected && heldInputActive) {
+            } else if (detection.detected && heldInputActive && !leftClickBlocked) {
                 if (keyHeld) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
@@ -970,7 +979,8 @@ void WorkerMain() {
 
                 if (g_app.armed.load(std::memory_order_relaxed) &&
                     !g_app.shuttingDown.load(std::memory_order_relaxed) &&
-                    RequiredHeldInputActive(cfg)) {
+                    RequiredHeldInputActive(cfg) &&
+                    !LeftClickBlockActive(cfg)) {
                     if (output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed)) {
                         ++nonHoldPressesSinceCooldown;
                     }
@@ -1288,6 +1298,7 @@ bool WriteConfigProfile(const std::wstring& profileName, const RuntimeConfig& cf
     WriteProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
     WriteProfileBool(path, section, L"HoldWhileVisible", cfg.holdWhileVisible);
     WriteProfileBool(path, section, L"RequireHeldInput", cfg.requireHeldInput);
+    WriteProfileBool(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld);
     WriteProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey));
     WriteProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey));
     WritePrivateProfileStringW(section.c_str(), L"SerialPort", cfg.serialPort.c_str(), path.c_str());
@@ -1336,6 +1347,7 @@ bool ReadConfigProfile(const std::wstring& profileName, RuntimeConfig& cfg) {
     cfg.scanIntervalMax = ReadProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
     cfg.holdWhileVisible = ReadProfileInt(path, section, L"HoldWhileVisible", cfg.holdWhileVisible ? 1 : 0) != 0;
     cfg.requireHeldInput = ReadProfileInt(path, section, L"RequireHeldInput", cfg.requireHeldInput ? 1 : 0) != 0;
+    cfg.blockWhileLeftClickHeld = ReadProfileInt(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld ? 1 : 0) != 0;
     cfg.heldInputKey = static_cast<DWORD>(ReadProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey)));
     cfg.toggleHotkey = static_cast<DWORD>(ReadProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey)));
 
@@ -1419,6 +1431,7 @@ void SetControlsFromConfig(HWND hwnd, const RuntimeConfig& cfg) {
     SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_BLOCK_LEFT_CLICK, cfg.blockWhileLeftClickHeld ? BST_CHECKED : BST_UNCHECKED);
 }
 
 bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) {
@@ -1474,6 +1487,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.targetColor = g_app.selectedTargetColor;
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
+    next.blockWhileLeftClickHeld = IsDlgButtonChecked(hwnd, IDC_BLOCK_LEFT_CLICK) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
         error = L"External Arduino input needs a COM port like COM3.";
@@ -1763,6 +1777,12 @@ void CreateMainControls(HWND hwnd) {
                     hwnd, reinterpret_cast<HMENU>(IDC_REQUIRE_HELD_INPUT), GetModuleHandleW(nullptr), nullptr);
     CreateLabel(hwnd, L"Held input", rightLabelX, y, labelW, rowH);
     CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 3, editW, rowH);
+
+    y += gap;
+    CreateWindowExW(0, L"BUTTON", L"Do not fire while left click is held",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    leftLabelX, y - 2, 300, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_BLOCK_LEFT_CLICK), GetModuleHandleW(nullptr), nullptr);
 
     y += gap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
@@ -2161,7 +2181,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1400, 450,
+        1400, 490,
         nullptr,
         nullptr,
         hInstance,
