@@ -163,6 +163,7 @@ constexpr int IDC_PROFILE_LOAD = 1031;
 constexpr int IDC_PROFILE_SAVE = 1032;
 constexpr int IDC_SERIAL_STATUS = 1033;
 constexpr int IDC_BLOCK_LEFT_CLICK = 1034;
+constexpr int IDC_STOP_MOVEMENT = 1035;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -208,6 +209,7 @@ struct RuntimeConfig {
     bool holdWhileVisible = false;
     bool requireHeldInput = false;
     bool blockWhileLeftClickHeld = false;
+    bool stopMovementOnDetect = true;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
     std::wstring serialPort = L"COM3";
@@ -239,6 +241,7 @@ struct AppState {
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
     std::atomic_bool colorPickActive{false};
+    std::atomic_bool movementSuppressed{false};
     std::atomic_int lastHits{0};
     std::atomic_int requiredHits{MIN_COLOR_PIXELS};
     std::atomic_int closestR{0};
@@ -247,6 +250,7 @@ struct AppState {
     std::atomic_int closestDelta{0};
     std::atomic_int serialStatusKind{static_cast<int>(SerialStatusKind::Idle)};
     std::thread worker;
+    HHOOK keyboardHook = nullptr;
 
     std::mutex configMutex;
     RuntimeConfig config;
@@ -259,6 +263,39 @@ struct AppState {
 AppState g_app;
 
 void PostSerialStatus(SerialStatusKind status);
+
+bool IsMovementKey(DWORD vk) {
+    return vk == L'W' || vk == L'A' || vk == L'S' || vk == L'D';
+}
+
+void ReleaseMovementKeys() {
+    constexpr DWORD keys[] = {L'W', L'A', L'S', L'D'};
+    INPUT inputs[sizeof(keys) / sizeof(keys[0])]{};
+    for (std::size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        inputs[i].type = INPUT_KEYBOARD;
+        inputs[i].ki.wVk = static_cast<WORD>(keys[i]);
+        inputs[i].ki.dwFlags = KEYEVENTF_KEYUP;
+    }
+    SendInput(static_cast<UINT>(sizeof(inputs) / sizeof(inputs[0])), inputs, sizeof(INPUT));
+}
+
+void SetMovementSuppressed(bool suppressed) {
+    const bool wasSuppressed = g_app.movementSuppressed.exchange(suppressed, std::memory_order_relaxed);
+    if (suppressed && !wasSuppressed) {
+        ReleaseMovementKeys();
+    }
+}
+
+LRESULT CALLBACK KeyboardHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && g_app.movementSuppressed.load(std::memory_order_relaxed)) {
+        const KBDLLHOOKSTRUCT* info = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+        if (keyDown && info && IsMovementKey(info->vkCode)) {
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_app.keyboardHook, code, wParam, lParam);
+}
 
 HBRUSH ThemeBackgroundBrush() {
     static HBRUSH brush = CreateSolidBrush(THEME_BG);
@@ -833,6 +870,7 @@ void WorkerMain() {
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
+            SetMovementSuppressed(false);
             if (keyHeld) {
                 output.up(heldConfig, heldKey);
                 keyHeld = false;
@@ -857,6 +895,7 @@ void WorkerMain() {
         cfg.minColorPixels = ClampInt(cfg.minColorPixels, 1, cfg.captureWidth * cfg.captureHeight);
 
         if (!capture.ensure(cfg.captureWidth, cfg.captureHeight)) {
+            SetMovementSuppressed(false);
             PostStatus(StatusKind::Disarmed);
             g_app.armed.store(false, std::memory_order_relaxed);
             Sleep(50);
@@ -891,6 +930,7 @@ void WorkerMain() {
                 PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
                 nextStatsUi = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
             }
+            SetMovementSuppressed(cfg.stopMovementOnDetect && detection.detected);
 
             const bool heldInputActive = RequiredHeldInputActive(cfg);
             const bool leftClickBlocked = LeftClickBlockActive(cfg);
@@ -1001,6 +1041,8 @@ void WorkerMain() {
                 heldKey = 0;
                 nextHeldKeyRefresh = std::chrono::steady_clock::now();
             }
+        } else {
+            SetMovementSuppressed(false);
         }
 
         const int scanIntervalMs = SampleBellCurveMs(rng, cfg.scanIntervalMin, cfg.scanIntervalMax);
@@ -1014,6 +1056,7 @@ void WorkerMain() {
     if (keyHeld) {
         output.up(heldConfig, heldKey);
     }
+    SetMovementSuppressed(false);
 }
 
 std::wstring GetWindowTextString(HWND hwnd) {
@@ -1299,6 +1342,7 @@ bool WriteConfigProfile(const std::wstring& profileName, const RuntimeConfig& cf
     WriteProfileBool(path, section, L"HoldWhileVisible", cfg.holdWhileVisible);
     WriteProfileBool(path, section, L"RequireHeldInput", cfg.requireHeldInput);
     WriteProfileBool(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld);
+    WriteProfileBool(path, section, L"StopMovementOnDetect", cfg.stopMovementOnDetect);
     WriteProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey));
     WriteProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey));
     WritePrivateProfileStringW(section.c_str(), L"SerialPort", cfg.serialPort.c_str(), path.c_str());
@@ -1348,6 +1392,7 @@ bool ReadConfigProfile(const std::wstring& profileName, RuntimeConfig& cfg) {
     cfg.holdWhileVisible = ReadProfileInt(path, section, L"HoldWhileVisible", cfg.holdWhileVisible ? 1 : 0) != 0;
     cfg.requireHeldInput = ReadProfileInt(path, section, L"RequireHeldInput", cfg.requireHeldInput ? 1 : 0) != 0;
     cfg.blockWhileLeftClickHeld = ReadProfileInt(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld ? 1 : 0) != 0;
+    cfg.stopMovementOnDetect = ReadProfileInt(path, section, L"StopMovementOnDetect", cfg.stopMovementOnDetect ? 1 : 0) != 0;
     cfg.heldInputKey = static_cast<DWORD>(ReadProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey)));
     cfg.toggleHotkey = static_cast<DWORD>(ReadProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey)));
 
@@ -1432,6 +1477,7 @@ void SetControlsFromConfig(HWND hwnd, const RuntimeConfig& cfg) {
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_BLOCK_LEFT_CLICK, cfg.blockWhileLeftClickHeld ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_STOP_MOVEMENT, cfg.stopMovementOnDetect ? BST_CHECKED : BST_UNCHECKED);
 }
 
 bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) {
@@ -1488,6 +1534,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
     next.blockWhileLeftClickHeld = IsDlgButtonChecked(hwnd, IDC_BLOCK_LEFT_CLICK) == BST_CHECKED;
+    next.stopMovementOnDetect = IsDlgButtonChecked(hwnd, IDC_STOP_MOVEMENT) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
         error = L"External Arduino input needs a COM port like COM3.";
@@ -1783,6 +1830,10 @@ void CreateMainControls(HWND hwnd) {
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     leftLabelX, y - 2, 300, rowH,
                     hwnd, reinterpret_cast<HMENU>(IDC_BLOCK_LEFT_CLICK), GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Stop WASD while color is detected",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    rightLabelX, y - 2, 300, rowH,
+                    hwnd, reinterpret_cast<HMENU>(IDC_STOP_MOVEMENT), GetModuleHandleW(nullptr), nullptr);
 
     y += gap;
     CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
@@ -1944,6 +1995,7 @@ void StartMonitoring(HWND hwnd) {
 
 void StopMonitoring() {
     g_app.armed.store(false, std::memory_order_relaxed);
+    SetMovementSuppressed(false);
     SetWindowTextW(g_app.status, L"Disarmed");
     EnableWindow(g_app.start, TRUE);
     EnableWindow(g_app.stop, FALSE);
@@ -1964,6 +2016,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         EnableDarkTitleBar(hwnd);
         CreateMainControls(hwnd);
         ApplyConfig(hwnd);
+        g_app.keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(nullptr), 0);
+        if (!g_app.keyboardHook) {
+            MessageBoxW(hwnd, L"Could not install the keyboard hook. WASD movement blocking will not work.", L"Keyboard hook unavailable", MB_ICONWARNING | MB_OK);
+        }
         g_app.worker = std::thread(WorkerMain);
         return 0;
 
@@ -2132,6 +2188,11 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         g_app.shuttingDown.store(true, std::memory_order_relaxed);
         g_app.armed.store(false, std::memory_order_relaxed);
+        SetMovementSuppressed(false);
+        if (g_app.keyboardHook) {
+            UnhookWindowsHookEx(g_app.keyboardHook);
+            g_app.keyboardHook = nullptr;
+        }
         if (g_app.registeredHotkey != 0) {
             UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
             g_app.registeredHotkey = 0;
