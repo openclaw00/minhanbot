@@ -106,14 +106,14 @@ struct RGB_COLOR {
 
 // Humanization / cadence jitter timing (milliseconds).
 constexpr int DELAY_BEFORE_PRESS_MIN = 1;
-constexpr int DELAY_BEFORE_PRESS_MAX = 10;
-constexpr int KEY_HOLD_MIN = 4;
-constexpr int KEY_HOLD_MAX = 30;
+constexpr int DELAY_BEFORE_PRESS_MAX = 2;
+constexpr int KEY_HOLD_MIN = 1;
+constexpr int KEY_HOLD_MAX = 2;
 constexpr int COOLDOWN_AFTER_PRESS_MIN = 0;
 constexpr int COOLDOWN_AFTER_PRESS_MAX = 0;
 constexpr int COOLDOWN_AFTER_PRESS_EVERY = 1;
 constexpr int RELEASE_DELAY_MIN = 1;
-constexpr int RELEASE_DELAY_MAX = 15;
+constexpr int RELEASE_DELAY_MAX = 2;
 constexpr DWORD TOGGLE_HOTKEY = VK_F8;
 constexpr int IDI_APP_ICON = 1;
 
@@ -209,7 +209,7 @@ struct RuntimeConfig {
     bool holdWhileVisible = false;
     bool requireHeldInput = false;
     bool blockWhileLeftClickHeld = false;
-    bool stopMovementOnDetect = true;
+    bool stopMovementOnDetect = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
     std::wstring serialPort = L"COM3";
