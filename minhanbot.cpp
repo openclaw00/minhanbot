@@ -89,8 +89,8 @@ void CloseWinRtObject(IUnknown* object) {
 }
 
 // === CONFIGURATION ===
-constexpr int CAPTURE_WIDTH = 25;
-constexpr int CAPTURE_HEIGHT = 20;
+constexpr int CAPTURE_WIDTH = 30;
+constexpr int CAPTURE_HEIGHT = 25;
 constexpr int COLOR_TOLERANCE = 40;
 constexpr int MIN_COLOR_PIXELS = 2;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
