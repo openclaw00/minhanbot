@@ -89,8 +89,8 @@ void CloseWinRtObject(IUnknown* object) {
 }
 
 // === CONFIGURATION ===
-constexpr int CAPTURE_WIDTH = 25;
-constexpr int CAPTURE_HEIGHT = 20;
+constexpr int CAPTURE_WIDTH = 30;
+constexpr int CAPTURE_HEIGHT = 25;
 constexpr int COLOR_TOLERANCE = 40;
 constexpr int MIN_COLOR_PIXELS = 2;
 constexpr DWORD TARGET_KEY = L'J'; // Virtual key code
@@ -162,7 +162,7 @@ constexpr int IDC_PROFILE_NAME = 1030;
 constexpr int IDC_PROFILE_LOAD = 1031;
 constexpr int IDC_PROFILE_SAVE = 1032;
 constexpr int IDC_SERIAL_STATUS = 1033;
-constexpr int IDC_BLOCK_LEFT_CLICK = 1034;
+constexpr int IDC_PRIORITIZE_LEFT_CLICK = 1034;
 constexpr int IDC_STOP_MOVEMENT = 1035;
 
 // Black-and-white dark UI theme.
@@ -208,7 +208,7 @@ struct RuntimeConfig {
     int scanIntervalMax = SCAN_INTERVAL_MAX;
     bool holdWhileVisible = false;
     bool requireHeldInput = false;
-    bool blockWhileLeftClickHeld = false;
+    bool prioritizeLeftClick = true;
     bool stopMovementOnDetect = false;
     DWORD heldInputKey = VK_RBUTTON;
     DWORD toggleHotkey = TOGGLE_HOTKEY;
@@ -803,18 +803,44 @@ public:
         serial_.send(false, vk, cfg.serialPort);
     }
 
-    bool press(const RuntimeConfig& cfg, DWORD vk, int holdMs, const std::atomic_bool& armed) {
+    bool press(
+        const RuntimeConfig& cfg,
+        DWORD vk,
+        int holdMs,
+        const std::atomic_bool& armed,
+        const std::atomic_bool& shuttingDown) {
+        if (cfg.prioritizeLeftClick && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+            return false;
+        }
+
         if (!down(cfg, vk)) {
             return false;
         }
 
         const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(holdMs);
-        while (armed.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < end) {
+        auto nextRefresh = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        bool success = true;
+        while (armed.load(std::memory_order_relaxed) &&
+               !shuttingDown.load(std::memory_order_relaxed)) {
+            const auto now = std::chrono::steady_clock::now();
+            const bool leftClickHeld = cfg.prioritizeLeftClick &&
+                                       (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            if (now >= end && !leftClickHeld) {
+                break;
+            }
+
+            if (leftClickHeld && now >= nextRefresh) {
+                if (!down(cfg, vk)) {
+                    success = false;
+                    break;
+                }
+                nextRefresh = now + std::chrono::milliseconds(500);
+            }
             Sleep(1);
         }
 
         up(cfg, vk);
-        return true;
+        return success;
     }
 
 private:
@@ -849,8 +875,8 @@ bool RequiredHeldInputActive(const RuntimeConfig& cfg) {
     return (GetAsyncKeyState(static_cast<int>(cfg.heldInputKey)) & 0x8000) != 0;
 }
 
-bool LeftClickBlockActive(const RuntimeConfig& cfg) {
-    return cfg.blockWhileLeftClickHeld &&
+bool PrioritizedLeftClickHeld(const RuntimeConfig& cfg) {
+    return cfg.prioritizeLeftClick &&
            (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 }
 
@@ -867,6 +893,8 @@ void WorkerMain() {
     auto releaseAt = std::chrono::steady_clock::now();
     auto nextHeldKeyRefresh = std::chrono::steady_clock::now();
     int nonHoldPressesSinceCooldown = 0;
+    bool nonHoldDetectionConsumed = false;
+    bool holdDetectionSuppressedByMouse = false;
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
@@ -879,6 +907,8 @@ void WorkerMain() {
             releasePending = false;
             nextHeldKeyRefresh = std::chrono::steady_clock::now();
             nonHoldPressesSinceCooldown = 0;
+            nonHoldDetectionConsumed = false;
+            holdDetectionSuppressedByMouse = false;
             Sleep(10);
             continue;
         }
@@ -933,11 +963,37 @@ void WorkerMain() {
             SetMovementSuppressed(cfg.stopMovementOnDetect && detection.detected);
 
             const bool heldInputActive = RequiredHeldInputActive(cfg);
-            const bool leftClickBlocked = LeftClickBlockActive(cfg);
+            const bool leftClickHeld = PrioritizedLeftClickHeld(cfg);
+            if (!detection.detected) {
+                nonHoldDetectionConsumed = false;
+                holdDetectionSuppressedByMouse = false;
+            }
 
             if (cfg.holdWhileVisible) {
                 nonHoldPressesSinceCooldown = 0;
-                if (detection.detected && heldInputActive && !leftClickBlocked) {
+                nonHoldDetectionConsumed = false;
+
+                // Once the mouse wins a newly detected activation, do not start the
+                // generated key after mouse-up; wait for the color to disappear first.
+                if (detection.detected && leftClickHeld && !keyHeld) {
+                    holdDetectionSuppressedByMouse = true;
+                }
+
+                // If the mouse arrives after the generated key-down, keep the key down.
+                // Releasing it here can cancel a game's shared mouse/keyboard fire action.
+                if (keyHeld && leftClickHeld) {
+                    releasePending = false;
+                    if (std::chrono::steady_clock::now() >= nextHeldKeyRefresh) {
+                        if (output.down(heldConfig, heldKey)) {
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                        } else {
+                            keyHeld = false;
+                            heldKey = 0;
+                            nextHeldKeyRefresh = std::chrono::steady_clock::now();
+                        }
+                    }
+                    PostStatus(StatusKind::Detected);
+                } else if (detection.detected && heldInputActive && !holdDetectionSuppressedByMouse) {
                     PostStatus(StatusKind::Detected);
                     releasePending = false;
 
@@ -957,7 +1013,7 @@ void WorkerMain() {
                         if (g_app.armed.load(std::memory_order_relaxed) &&
                             !g_app.shuttingDown.load(std::memory_order_relaxed) &&
                             RequiredHeldInputActive(cfg) &&
-                            !LeftClickBlockActive(cfg) &&
+                            !PrioritizedLeftClickHeld(cfg) &&
                             output.down(cfg, cfg.targetKey)) {
                             keyHeld = true;
                             heldKey = cfg.targetKey;
@@ -974,7 +1030,7 @@ void WorkerMain() {
                             nextHeldKeyRefresh = std::chrono::steady_clock::now();
                         }
                     }
-                } else if (keyHeld && (!heldInputActive || leftClickBlocked)) {
+                } else if (keyHeld && !heldInputActive) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
                     heldKey = 0;
@@ -999,7 +1055,15 @@ void WorkerMain() {
                     }
                     PostStatus(g_app.armed.load(std::memory_order_relaxed) ? StatusKind::Armed : StatusKind::Disarmed);
                 }
-            } else if (detection.detected && heldInputActive && !leftClickBlocked) {
+            } else if (detection.detected &&
+                       heldInputActive &&
+                       (!cfg.prioritizeLeftClick || !nonHoldDetectionConsumed)) {
+                if (cfg.prioritizeLeftClick) {
+                    // Consume this color appearance even when the mouse wins, so the
+                    // generated key cannot fire immediately after mouse-up.
+                    nonHoldDetectionConsumed = true;
+                }
+
                 if (keyHeld) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
@@ -1020,8 +1084,13 @@ void WorkerMain() {
                 if (g_app.armed.load(std::memory_order_relaxed) &&
                     !g_app.shuttingDown.load(std::memory_order_relaxed) &&
                     RequiredHeldInputActive(cfg) &&
-                    !LeftClickBlockActive(cfg)) {
-                    if (output.press(cfg, cfg.targetKey, holdDist(rng), g_app.armed)) {
+                    !PrioritizedLeftClickHeld(cfg)) {
+                    if (output.press(
+                            cfg,
+                            cfg.targetKey,
+                            holdDist(rng),
+                            g_app.armed,
+                            g_app.shuttingDown)) {
                         ++nonHoldPressesSinceCooldown;
                     }
                 }
@@ -1341,7 +1410,7 @@ bool WriteConfigProfile(const std::wstring& profileName, const RuntimeConfig& cf
     WriteProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
     WriteProfileBool(path, section, L"HoldWhileVisible", cfg.holdWhileVisible);
     WriteProfileBool(path, section, L"RequireHeldInput", cfg.requireHeldInput);
-    WriteProfileBool(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld);
+    WriteProfileBool(path, section, L"PrioritizeLeftClick", cfg.prioritizeLeftClick);
     WriteProfileBool(path, section, L"StopMovementOnDetect", cfg.stopMovementOnDetect);
     WriteProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey));
     WriteProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey));
@@ -1391,7 +1460,7 @@ bool ReadConfigProfile(const std::wstring& profileName, RuntimeConfig& cfg) {
     cfg.scanIntervalMax = ReadProfileInt(path, section, L"ScanIntervalMax", cfg.scanIntervalMax);
     cfg.holdWhileVisible = ReadProfileInt(path, section, L"HoldWhileVisible", cfg.holdWhileVisible ? 1 : 0) != 0;
     cfg.requireHeldInput = ReadProfileInt(path, section, L"RequireHeldInput", cfg.requireHeldInput ? 1 : 0) != 0;
-    cfg.blockWhileLeftClickHeld = ReadProfileInt(path, section, L"BlockWhileLeftClickHeld", cfg.blockWhileLeftClickHeld ? 1 : 0) != 0;
+    cfg.prioritizeLeftClick = ReadProfileInt(path, section, L"PrioritizeLeftClick", cfg.prioritizeLeftClick ? 1 : 0) != 0;
     cfg.stopMovementOnDetect = ReadProfileInt(path, section, L"StopMovementOnDetect", cfg.stopMovementOnDetect ? 1 : 0) != 0;
     cfg.heldInputKey = static_cast<DWORD>(ReadProfileInt(path, section, L"HeldInputKey", static_cast<int>(cfg.heldInputKey)));
     cfg.toggleHotkey = static_cast<DWORD>(ReadProfileInt(path, section, L"ToggleHotkey", static_cast<int>(cfg.toggleHotkey)));
@@ -1476,7 +1545,7 @@ void SetControlsFromConfig(HWND hwnd, const RuntimeConfig& cfg) {
     SetWindowTextW(GetDlgItem(hwnd, IDC_SERIAL_PORT), cfg.serialPort.c_str());
     CheckDlgButton(hwnd, IDC_HOLD_WHILE_VISIBLE, cfg.holdWhileVisible ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_REQUIRE_HELD_INPUT, cfg.requireHeldInput ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(hwnd, IDC_BLOCK_LEFT_CLICK, cfg.blockWhileLeftClickHeld ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_PRIORITIZE_LEFT_CLICK, cfg.prioritizeLeftClick ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hwnd, IDC_STOP_MOVEMENT, cfg.stopMovementOnDetect ? BST_CHECKED : BST_UNCHECKED);
 }
 
@@ -1533,7 +1602,7 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.targetColor = g_app.selectedTargetColor;
     next.holdWhileVisible = IsDlgButtonChecked(hwnd, IDC_HOLD_WHILE_VISIBLE) == BST_CHECKED;
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
-    next.blockWhileLeftClickHeld = IsDlgButtonChecked(hwnd, IDC_BLOCK_LEFT_CLICK) == BST_CHECKED;
+    next.prioritizeLeftClick = IsDlgButtonChecked(hwnd, IDC_PRIORITIZE_LEFT_CLICK) == BST_CHECKED;
     next.stopMovementOnDetect = IsDlgButtonChecked(hwnd, IDC_STOP_MOVEMENT) == BST_CHECKED;
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
@@ -1826,10 +1895,10 @@ void CreateMainControls(HWND hwnd) {
     CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 3, editW, rowH);
 
     y += gap;
-    CreateWindowExW(0, L"BUTTON", L"Do not fire while left click is held",
+    CreateWindowExW(0, L"BUTTON", L"Prioritize left click",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     leftLabelX, y - 2, 300, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_BLOCK_LEFT_CLICK), GetModuleHandleW(nullptr), nullptr);
+                    hwnd, reinterpret_cast<HMENU>(IDC_PRIORITIZE_LEFT_CLICK), GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"BUTTON", L"Stop WASD while color is detected",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                     rightLabelX, y - 2, 300, rowH,

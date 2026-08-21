@@ -10,7 +10,8 @@ Requires Windows 10 version 1903 or newer.
 - Detects a screen-picked RGB target color with per-channel tolerance and a configurable required pixel count.
 - Sends configurable key down/up commands only to an external USB HID bridge over serial, so the target app sees input from a real keyboard device.
 - Optionally stops real-keyboard WASD movement while the target color is detected by releasing those keys once and blocking new WASD key-down events until the color disappears.
-- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, optional held-input gating, hold-while-visible mode, release delay, bell-curve scan interval, saved profiles, and a Start/Stop hotkey.
+- Provides runtime controls for capture size, target color, tolerance, required color pixels, key to press, bell-curve reaction delay, key press length, non-hold cooldown timing and activation count, optional held-input gating, default-enabled left-click priority, hold-while-visible mode, release delay, bell-curve scan interval, saved profiles, and a Start/Stop hotkey.
+- Left-click priority prevents a new generated press while the mouse is held. If left-click begins during a generated press, key-up is deferred until mouse-up, with periodic refreshes to keep the external HID watchdog alive.
 - Shows a red/green serial status indicator for Arduino connection/write failures.
 - Shows a live zoomed preview of the monitored area.
 
