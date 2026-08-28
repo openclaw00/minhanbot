@@ -38,7 +38,12 @@ const KeyMap SPECIAL_KEYS[] = {
 };
 
 const unsigned long COMMAND_TIMEOUT_MS = 1500;
+const unsigned long COMMAND_PARSE_TIMEOUT_MS = 100;
+const byte COMMAND_BUFFER_SIZE = 8;
 unsigned long lastCommandAt = 0;
+unsigned long commandStartedAt = 0;
+char commandBuffer[COMMAND_BUFFER_SIZE];
+byte commandLength = 0;
 
 byte keyForVirtualKey(byte vk) {
   if (vk >= 'A' && vk <= 'Z') {
@@ -70,6 +75,47 @@ int hexValue(char ch) {
   return -1;
 }
 
+void resetCommand() {
+  commandLength = 0;
+  commandStartedAt = 0;
+}
+
+void runCommand() {
+  if (commandLength < 3) {
+    return;
+  }
+
+  byte index = 1;
+  while (index < commandLength && commandBuffer[index] == ' ') {
+    ++index;
+  }
+  if (index + 2 > commandLength) {
+    return;
+  }
+
+  const int hi = hexValue(commandBuffer[index]);
+  const int lo = hexValue(commandBuffer[index + 1]);
+  index += 2;
+  while (index < commandLength && commandBuffer[index] == ' ') {
+    ++index;
+  }
+  if (hi < 0 || lo < 0 || index != commandLength) {
+    return;
+  }
+
+  const byte key = keyForVirtualKey(static_cast<byte>((hi << 4) | lo));
+  if (key == 0) {
+    return;
+  }
+
+  if (commandBuffer[0] == 'D') {
+    Keyboard.press(key);
+  } else {
+    Keyboard.release(key);
+  }
+  lastCommandAt = millis();
+}
+
 void setup() {
   Serial.begin(115200);
   Keyboard.begin();
@@ -82,38 +128,36 @@ void loop() {
     lastCommandAt = millis();
   }
 
-  if (!Serial.available()) {
-    return;
+  if (commandLength > 0 && millis() - commandStartedAt > COMMAND_PARSE_TIMEOUT_MS) {
+    resetCommand();
   }
 
-  const char action = Serial.read();
-  if (action != 'D' && action != 'U') {
-    return;
-  }
+  while (Serial.available()) {
+    const int incoming = Serial.read();
+    if (incoming < 0) {
+      break;
+    }
+    const char ch = static_cast<char>(incoming);
+    if (ch == '\r') {
+      continue;
+    }
+    if (ch == '\n') {
+      runCommand();
+      resetCommand();
+      continue;
+    }
 
-  while (Serial.available() && Serial.peek() == ' ') {
-    Serial.read();
-  }
+    if (commandLength == 0) {
+      if (ch != 'D' && ch != 'U') {
+        continue;
+      }
+      commandStartedAt = millis();
+    }
 
-  while (Serial.available() < 2) {
-    delay(1);
+    if (commandLength < COMMAND_BUFFER_SIZE) {
+      commandBuffer[commandLength++] = ch;
+    } else {
+      resetCommand();
+    }
   }
-
-  const int hi = hexValue(Serial.read());
-  const int lo = hexValue(Serial.read());
-  if (hi < 0 || lo < 0) {
-    return;
-  }
-
-  const byte key = keyForVirtualKey((hi << 4) | lo);
-  if (key == 0) {
-    return;
-  }
-
-  if (action == 'D') {
-    Keyboard.press(key);
-  } else {
-    Keyboard.release(key);
-  }
-  lastCommandAt = millis();
 }

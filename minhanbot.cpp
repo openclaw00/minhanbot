@@ -164,6 +164,17 @@ constexpr int IDC_PROFILE_SAVE = 1032;
 constexpr int IDC_SERIAL_STATUS = 1033;
 constexpr int IDC_PRIORITIZE_LEFT_CLICK = 1034;
 constexpr int IDC_STOP_MOVEMENT = 1035;
+constexpr int IDC_SECTION_HEADER = 1036;
+constexpr int IDC_SEPARATOR = 1037;
+
+// Preview layout. The configured capture is scaled to fit this bounding box.
+constexpr int PREVIEW_X = 820;
+constexpr int PREVIEW_Y = 120;
+constexpr int PREVIEW_MAX_WIDTH = 360;
+constexpr int PREVIEW_MAX_HEIGHT = 280;
+constexpr int PREVIEW_STATS_GAP = 18;
+constexpr int PREVIEW_STATS_WIDTH = 360;
+constexpr int PREVIEW_STATS_HEIGHT = 56;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -175,6 +186,7 @@ constexpr COLORREF THEME_BORDER_HOT = RGB(170, 170, 170);
 constexpr COLORREF THEME_TEXT = RGB(245, 245, 245);
 constexpr COLORREF THEME_MUTED = RGB(178, 178, 178);
 constexpr COLORREF THEME_DISABLED = RGB(94, 94, 94);
+constexpr COLORREF THEME_ACCENT = RGB(232, 36, 91);
 
 enum class StatusKind : int {
     Disarmed,
@@ -236,6 +248,8 @@ struct AppState {
     HWND profileLoad = nullptr;
     HWND profileSave = nullptr;
     HWND serialStatus = nullptr;
+    HFONT uiFont = nullptr;
+    HFONT sectionFont = nullptr;
     DWORD registeredHotkey = 0;
 
     std::atomic_bool armed{false};
@@ -261,6 +275,29 @@ struct AppState {
 };
 
 AppState g_app;
+UINT g_uiDpi = USER_DEFAULT_SCREEN_DPI;
+
+int ScaleUi(int value) {
+    return MulDiv(value, static_cast<int>(g_uiDpi), USER_DEFAULT_SCREEN_DPI);
+}
+
+void CreateUiFonts() {
+    const int bodyHeight = -MulDiv(9, static_cast<int>(g_uiDpi), 72);
+    const int sectionHeight = -MulDiv(9, static_cast<int>(g_uiDpi), 72);
+    g_app.uiFont = CreateFontW(bodyHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_app.sectionFont = CreateFontW(sectionHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+void SetUiFont(HWND hwnd, bool section = false) {
+    if (hwnd) {
+        SendMessageW(hwnd, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(section ? g_app.sectionFont : g_app.uiFont), TRUE);
+    }
+}
 
 void PostSerialStatus(SerialStatusKind status);
 
@@ -317,12 +354,30 @@ HBRUSH ThemeListBrush() {
     return brush;
 }
 
+HBRUSH ThemeBorderBrush() {
+    static HBRUSH brush = CreateSolidBrush(THEME_BORDER);
+    return brush;
+}
+
 template <typename T>
 void SafeRelease(T*& ptr) {
     if (ptr) {
         ptr->Release();
         ptr = nullptr;
     }
+}
+
+template <typename Function>
+Function LoadFunction(HMODULE module, const char* name) {
+    Function function = nullptr;
+    if (!module) {
+        return function;
+    }
+
+    const FARPROC address = GetProcAddress(module, name);
+    static_assert(sizeof(function) == sizeof(address), "Windows function-pointer size mismatch");
+    std::memcpy(&function, &address, sizeof(function));
+    return function;
 }
 
 int ClampInt(int value, int lo, int hi) {
@@ -392,10 +447,8 @@ public:
         }
 
         HMODULE d3d11Module = GetModuleHandleW(L"d3d11.dll");
-        const auto createWinRtDevice = d3d11Module
-            ? reinterpret_cast<CreateDirect3D11DeviceFromDXGIDeviceFn>(
-                  GetProcAddress(d3d11Module, "CreateDirect3D11DeviceFromDXGIDevice"))
-            : nullptr;
+        const auto createWinRtDevice = LoadFunction<CreateDirect3D11DeviceFromDXGIDeviceFn>(
+            d3d11Module, "CreateDirect3D11DeviceFromDXGIDevice");
         if (!createWinRtDevice) {
             SafeRelease(dxgiDevice);
             reset();
@@ -775,7 +828,10 @@ private:
         COMMTIMEOUTS timeouts{};
         timeouts.WriteTotalTimeoutConstant = 20;
         timeouts.WriteTotalTimeoutMultiplier = 1;
-        SetCommTimeouts(handle_, &timeouts);
+        if (!SetCommTimeouts(handle_, &timeouts)) {
+            close();
+            return false;
+        }
 
         openPort_ = port;
         return true;
@@ -1141,8 +1197,15 @@ std::wstring GetWindowTextString(HWND hwnd) {
 bool ParseIntControl(HWND parent, int id, int& out) {
     const std::wstring text = GetWindowTextString(GetDlgItem(parent, id));
     wchar_t* end = nullptr;
-    const long value = wcstol(text.c_str(), &end, 0);
-    if (end == text.c_str() || value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+    const long value = wcstol(text.c_str(), &end, 10);
+    if (end == text.c_str()) {
+        return false;
+    }
+    while (end && iswspace(*end) != 0) {
+        ++end;
+    }
+    if (!end || *end != L'\0' ||
+        value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
         return false;
     }
     out = static_cast<int>(value);
@@ -1614,29 +1677,56 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     return true;
 }
 
-void CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
-    CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w, int h) {
+    HWND hwnd = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
+                                ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+                                parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
+}
+
+HWND CreateSectionHeader(HWND parent, const wchar_t* text, int x, int y, int w) {
+    HWND hwnd = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
+                                ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(20),
+                                parent, reinterpret_cast<HMENU>(IDC_SECTION_HEADER), GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd, true);
+    return hwnd;
+}
+
+HWND CreateSeparator(HWND parent, int x, int y, int w) {
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+                                ScaleUi(x), ScaleUi(y), ScaleUi(w), std::max(1, ScaleUi(1)),
+                                parent, reinterpret_cast<HMENU>(IDC_SEPARATOR), GetModuleHandleW(nullptr), nullptr);
+    return hwnd;
 }
 
 HWND CreateButton(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
-    return CreateWindowExW(
+    HWND hwnd = CreateWindowExW(
         0, L"BUTTON", text,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+        ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+        parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
 }
 
 HWND CreateEdit(HWND parent, int id, int x, int y, int w, int h) {
-    return CreateWindowExW(
+    HWND hwnd = CreateWindowExW(
         WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+        ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+        parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
 }
 
 HWND CreateSlider(HWND parent, int id, int x, int y, int w, int h, int minValue, int maxValue) {
     HWND hwnd = CreateWindowExW(
         0, TRACKBAR_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS,
-        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+        ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+        parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
     SendMessageW(hwnd, TBM_SETRANGE, TRUE, MAKELPARAM(minValue, maxValue));
     SendMessageW(hwnd, TBM_SETTICFREQ, 15, 0);
     SendMessageW(hwnd, TBM_SETPAGESIZE, 0, 5);
@@ -1645,10 +1735,34 @@ HWND CreateSlider(HWND parent, int id, int x, int y, int w, int h, int minValue,
 }
 
 HWND CreateCombo(HWND parent, int id, int x, int y, int w, int h) {
-    return CreateWindowExW(
+    HWND hwnd = CreateWindowExW(
         WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL,
-        x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+        ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+        parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
+}
+
+HWND CreateCheckbox(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
+    HWND hwnd = CreateWindowExW(0, L"BUTTON", text,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+                                parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
+}
+
+HWND CreateStaticField(HWND parent, int id, const wchar_t* text,
+                       int x, int y, int w, int h, DWORD alignment = SS_CENTERIMAGE) {
+    HWND hwnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", text,
+                                WS_CHILD | WS_VISIBLE | alignment,
+                                ScaleUi(x), ScaleUi(y), ScaleUi(w), ScaleUi(h),
+                                parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(hwnd);
+    return hwnd;
 }
 
 void PopulateHitThresholdChoices(HWND combo) {
@@ -1674,12 +1788,22 @@ void DrawButtonControl(const DRAWITEMSTRUCT& item) {
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const bool focused = (item.itemState & ODS_FOCUS) != 0;
+    const int id = GetDlgCtrlID(item.hwndItem);
+    const bool primary = id == IDC_START;
 
-    HBRUSH fill = CreateSolidBrush(disabled ? RGB(20, 20, 20) : (pressed ? RGB(36, 36, 36) : THEME_PANEL));
+    COLORREF fillColor = THEME_PANEL;
+    if (disabled) {
+        fillColor = RGB(20, 20, 20);
+    } else if (primary) {
+        fillColor = pressed ? RGB(190, 25, 70) : THEME_ACCENT;
+    } else if (pressed) {
+        fillColor = RGB(36, 36, 36);
+    }
+    HBRUSH fill = CreateSolidBrush(fillColor);
     FillRect(hdc, &rc, fill);
     DeleteObject(fill);
 
-    HPEN border = CreatePen(PS_SOLID, 1, focused ? THEME_BORDER_HOT : THEME_BORDER);
+    HPEN border = CreatePen(PS_SOLID, 1, focused || primary ? THEME_BORDER_HOT : THEME_BORDER);
     HGDIOBJ oldPen = SelectObject(hdc, border);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
@@ -1689,12 +1813,16 @@ void DrawButtonControl(const DRAWITEMSTRUCT& item) {
 
     wchar_t text[128]{};
     GetWindowTextW(item.hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
+    HGDIOBJ oldFont = g_app.uiFont ? SelectObject(hdc, g_app.uiFont) : nullptr;
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, disabled ? THEME_DISABLED : THEME_TEXT);
     if (pressed) {
         OffsetRect(&rc, 1, 1);
     }
     DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (oldFont) {
+        SelectObject(hdc, oldFont);
+    }
 }
 
 void ApplyCtlColor(HDC hdc, COLORREF bg, COLORREF fg = THEME_TEXT) {
@@ -1709,8 +1837,7 @@ void EnableDarkTitleBar(HWND hwnd) {
     }
 
     using DwmSetWindowAttributeFn = HRESULT (WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
-    auto setWindowAttribute = reinterpret_cast<DwmSetWindowAttributeFn>(
-        GetProcAddress(dwmapi, "DwmSetWindowAttribute"));
+    auto setWindowAttribute = LoadFunction<DwmSetWindowAttributeFn>(dwmapi, "DwmSetWindowAttribute");
     if (setWindowAttribute) {
         const BOOL enabled = TRUE;
         // Windows 10 1809+ uses 20; older builds used 19 for the same dark-title-bar flag.
@@ -1734,6 +1861,33 @@ void PopulateDefaults(HWND hwnd) {
     SetControlsFromConfig(hwnd, cfg);
 }
 
+void ResizePreviewForCapture(int captureWidth, int captureHeight) {
+    if (!g_app.preview || captureWidth <= 0 || captureHeight <= 0) {
+        return;
+    }
+
+    int previewWidth = PREVIEW_MAX_WIDTH;
+    int previewHeight = PREVIEW_MAX_HEIGHT;
+    if (captureWidth * PREVIEW_MAX_HEIGHT > captureHeight * PREVIEW_MAX_WIDTH) {
+        previewHeight = std::max(1, MulDiv(PREVIEW_MAX_WIDTH, captureHeight, captureWidth));
+    } else {
+        previewWidth = std::max(1, MulDiv(PREVIEW_MAX_HEIGHT, captureWidth, captureHeight));
+    }
+
+    const int previewX = PREVIEW_X + (PREVIEW_MAX_WIDTH - previewWidth) / 2;
+    MoveWindow(g_app.preview,
+               ScaleUi(previewX), ScaleUi(PREVIEW_Y),
+               ScaleUi(previewWidth), ScaleUi(previewHeight), TRUE);
+    if (g_app.stats) {
+        MoveWindow(g_app.stats,
+                   ScaleUi(PREVIEW_X),
+                   ScaleUi(PREVIEW_Y + previewHeight + PREVIEW_STATS_GAP),
+                   ScaleUi(PREVIEW_STATS_WIDTH),
+                   ScaleUi(PREVIEW_STATS_HEIGHT),
+                   TRUE);
+    }
+}
+
 void DrawPreview(HWND hwnd, HDC hdc) {
     RECT rc{};
     GetClientRect(hwnd, &rc);
@@ -1749,7 +1903,11 @@ void DrawPreview(HWND hwnd, HDC hdc) {
     if (frame.width <= 0 || frame.height <= 0 || frame.bgra.empty()) {
         SetTextColor(hdc, RGB(180, 180, 180));
         SetBkMode(hdc, TRANSPARENT);
+        HGDIOBJ oldFont = g_app.uiFont ? SelectObject(hdc, g_app.uiFont) : nullptr;
         DrawTextW(hdc, L"No preview", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (oldFont) {
+            SelectObject(hdc, oldFont);
+        }
         return;
     }
 
@@ -1761,9 +1919,25 @@ void DrawPreview(HWND hwnd, HDC hdc) {
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
+    const int clientWidth = rc.right - rc.left;
+    const int clientHeight = rc.bottom - rc.top;
+    if (clientWidth <= 0 || clientHeight <= 0) {
+        return;
+    }
+    int drawWidth = clientWidth;
+    int drawHeight = clientHeight;
+    if (frame.width * clientHeight > frame.height * clientWidth) {
+        drawHeight = std::max(1, MulDiv(clientWidth, frame.height, frame.width));
+    } else {
+        drawWidth = std::max(1, MulDiv(clientHeight, frame.width, frame.height));
+    }
+    const int drawX = (clientWidth - drawWidth) / 2;
+    const int drawY = (clientHeight - drawHeight) / 2;
+
+    SetStretchBltMode(hdc, COLORONCOLOR);
     StretchDIBits(
         hdc,
-        0, 0, rc.right - rc.left, rc.bottom - rc.top,
+        drawX, drawY, drawWidth, drawHeight,
         0, 0, frame.width, frame.height,
         frame.bgra.data(),
         &bmi,
@@ -1786,143 +1960,106 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 }
 
 void CreateMainControls(HWND hwnd) {
-    g_app.start = CreateButton(hwnd, IDC_START, L"Start", 16, 16, 86, 30);
-    g_app.stop = CreateButton(hwnd, IDC_STOP, L"Stop", 112, 16, 86, 30);
-    g_app.apply = CreateButton(hwnd, IDC_APPLY, L"Apply", 208, 16, 86, 30);
+    g_app.start = CreateButton(hwnd, IDC_START, L"Start", 16, 16, 82, 34);
+    g_app.stop = CreateButton(hwnd, IDC_STOP, L"Stop", 106, 16, 82, 34);
+    g_app.apply = CreateButton(hwnd, IDC_APPLY, L"Apply", 196, 16, 82, 34);
 
-    CreateLabel(hwnd, L"Status", 360, 21, 60, 20);
-    g_app.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Disarmed",
-                                   WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                   430, 16, 140, 30, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), GetModuleHandleW(nullptr), nullptr);
+    CreateLabel(hwnd, L"Status", 310, 23, 48, 20);
+    g_app.status = CreateStaticField(hwnd, IDC_STATUS, L"Disarmed", 366, 16, 130, 34, SS_CENTERIMAGE | SS_CENTER);
 
-    CreateLabel(hwnd, L"Profile", 600, 21, 54, 20);
-    g_app.profileName = CreateCombo(hwnd, IDC_PROFILE_NAME, 656, 16, 130, 160);
-    g_app.profileLoad = CreateButton(hwnd, IDC_PROFILE_LOAD, L"Load", 798, 16, 64, 30);
-    g_app.profileSave = CreateButton(hwnd, IDC_PROFILE_SAVE, L"Save", 872, 16, 64, 30);
+    CreateLabel(hwnd, L"Profile", 530, 23, 48, 20);
+    g_app.profileName = CreateCombo(hwnd, IDC_PROFILE_NAME, 584, 16, 150, 180);
+    g_app.profileLoad = CreateButton(hwnd, IDC_PROFILE_LOAD, L"Load", 742, 16, 70, 34);
+    g_app.profileSave = CreateButton(hwnd, IDC_PROFILE_SAVE, L"Save", 820, 16, 70, 34);
+    CreateSeparator(hwnd, 16, 66, 1164);
 
-    int y = 66;
-    constexpr int labelW = 170;
-    constexpr int editW = 90;
-    constexpr int smallEditW = 70;
-    constexpr int rowH = 24;
-    constexpr int gap = 30;
-    constexpr int leftLabelX = 16;
-    constexpr int leftEditX = 190;
-    constexpr int leftUnitX = 292;
-    constexpr int rightLabelX = 520;
-    constexpr int rightEditX = 710;
-    constexpr int rightUnitX = 812;
-    constexpr int previewX = 1000;
+    constexpr int leftX = 24;
+    constexpr int leftFieldX = 160;
+    constexpr int middleX = 420;
+    constexpr int middleFieldX = 590;
+    constexpr int rowH = 26;
 
-    CreateLabel(hwnd, L"Capture width", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_WIDTH, leftEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", leftUnitX, y, 30, rowH);
-    CreateLabel(hwnd, L"Capture height", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HEIGHT, rightEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"px", rightUnitX, y, 30, rowH);
+    CreateSectionHeader(hwnd, L"DETECTION", leftX, 84, 92);
+    CreateSeparator(hwnd, 120, 94, 270);
 
-    y += gap;
-    CreateLabel(hwnd, L"RGB tolerance", leftLabelX, y, labelW, rowH);
-    g_app.toleranceSlider = CreateSlider(hwnd, IDC_TOLERANCE, leftEditX, y - 6, 160, 30, 0, 255);
-    g_app.toleranceValue = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
-                                           WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_CENTER,
-                                           leftEditX + 170, y - 3, 62, rowH,
-                                           hwnd, reinterpret_cast<HMENU>(IDC_TOLERANCE_VALUE), GetModuleHandleW(nullptr), nullptr);
-    CreateLabel(hwnd, L"Required pixels", rightLabelX, y, labelW, rowH);
-    HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, rightEditX, y - 3, editW, 160);
+    CreateLabel(hwnd, L"Capture area", leftX, 124, 120, 20);
+    CreateEdit(hwnd, IDC_WIDTH, leftFieldX, 120, 64, rowH);
+    CreateLabel(hwnd, L"x", 234, 124, 16, 20);
+    CreateEdit(hwnd, IDC_HEIGHT, 258, 120, 64, rowH);
+    CreateLabel(hwnd, L"px", 332, 124, 28, 20);
+
+    CreateLabel(hwnd, L"RGB tolerance", leftX, 160, 120, 20);
+    g_app.toleranceSlider = CreateSlider(hwnd, IDC_TOLERANCE, leftFieldX, 153, 150, 32, 0, 255);
+    g_app.toleranceValue = CreateStaticField(hwnd, IDC_TOLERANCE_VALUE, L"", 320, 156, 52, rowH,
+                                             SS_CENTERIMAGE | SS_CENTER);
+
+    CreateLabel(hwnd, L"Target color", leftX, 196, 120, 20);
+    CreateButton(hwnd, IDC_PICK_COLOR, L"Pick screen", leftFieldX, 192, 92, rowH);
+    g_app.targetColorText = CreateStaticField(hwnd, IDC_TARGET_COLOR, L"", 262, 192, 128, rowH);
+
+    CreateLabel(hwnd, L"Required pixels", leftX, 232, 120, 20);
+    HWND minPixels = CreateCombo(hwnd, IDC_MIN_COLOR_PIXELS, leftFieldX, 228, 90, 180);
     PopulateHitThresholdChoices(minPixels);
 
-    y += gap;
-    CreateLabel(hwnd, L"Target color", leftLabelX, y, labelW, rowH);
-    CreateButton(hwnd, IDC_PICK_COLOR, L"Pick screen", leftEditX, y - 3, editW, rowH);
-    g_app.targetColorText = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
-                                            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                            leftEditX + 108, y - 3, 150, rowH,
-                                            hwnd, reinterpret_cast<HMENU>(IDC_TARGET_COLOR), GetModuleHandleW(nullptr), nullptr);
+    CreateSectionHeader(hwnd, L"TIMING", leftX, 276, 66);
+    CreateSeparator(hwnd, 94, 286, 296);
 
-    y += gap;
-    CreateLabel(hwnd, L"Delay before key", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_PRE_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_PRE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
-    CreateLabel(hwnd, L"Key to press", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_KEY, rightEditX, y - 3, editW, rowH);
+    auto createRangeRow = [hwnd](const wchar_t* label, int minId, int maxId, int y) {
+        CreateLabel(hwnd, label, leftX, y + 4, 126, 20);
+        CreateEdit(hwnd, minId, leftFieldX, y, 64, rowH);
+        CreateLabel(hwnd, L"to", 232, y + 4, 18, 20);
+        CreateEdit(hwnd, maxId, 258, y, 64, rowH);
+        CreateLabel(hwnd, L"ms", 332, y + 4, 28, 20);
+    };
 
-    y += gap;
-    CreateLabel(hwnd, L"Key press length", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_HOLD_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    createRangeRow(L"Delay before key", IDC_PRE_MIN, IDC_PRE_MAX, 312);
+    createRangeRow(L"Key press length", IDC_HOLD_MIN, IDC_HOLD_MAX, 348);
+    createRangeRow(L"Cooldown after key", IDC_COOLDOWN_MIN, IDC_COOLDOWN_MAX, 384);
+    createRangeRow(L"Release delay", IDC_RELEASE_MIN, IDC_RELEASE_MAX, 420);
+    createRangeRow(L"Scan interval", IDC_SCAN_MIN, IDC_SCAN_MAX, 456);
 
-    y += gap;
-    CreateLabel(hwnd, L"Cooldown after key", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
-    CreateLabel(hwnd, L"Cooldown every", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_COOLDOWN_EVERY, rightEditX, y - 3, editW, rowH);
-    CreateLabel(hwnd, L"hits", rightUnitX, y, 48, rowH);
+    CreateLabel(hwnd, L"Cooldown every", leftX, 496, 126, 20);
+    CreateEdit(hwnd, IDC_COOLDOWN_EVERY, leftFieldX, 492, 64, rowH);
+    CreateLabel(hwnd, L"hits", 234, 496, 40, 20);
 
-    y += gap;
-    CreateWindowExW(0, L"BUTTON", L"Hold key while color is visible",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    leftLabelX, y - 2, 300, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_HOLD_WHILE_VISIBLE), GetModuleHandleW(nullptr), nullptr);
+    CreateSectionHeader(hwnd, L"TRIGGER", middleX, 84, 70);
+    CreateSeparator(hwnd, 504, 94, 286);
 
-    y += gap;
-    CreateLabel(hwnd, L"Release delay", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_RELEASE_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_RELEASE_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateLabel(hwnd, L"Key to press", middleX, 124, 150, 20);
+    CreateEdit(hwnd, IDC_KEY, middleFieldX, 120, 90, rowH);
+    CreateCheckbox(hwnd, IDC_HOLD_WHILE_VISIBLE, L"Hold key while color is visible", middleX, 160, 300, 24);
+    CreateCheckbox(hwnd, IDC_REQUIRE_HELD_INPUT, L"Only fire while held", middleX, 196, 220, 24);
+    CreateLabel(hwnd, L"Held input", middleX, 236, 150, 20);
+    CreateEdit(hwnd, IDC_HELD_INPUT_KEY, middleFieldX, 232, 90, rowH);
+    CreateCheckbox(hwnd, IDC_PRIORITIZE_LEFT_CLICK, L"Prioritize left click", middleX, 272, 250, 24);
+    CreateCheckbox(hwnd, IDC_STOP_MOVEMENT, L"Stop WASD while color is detected", middleX, 308, 330, 24);
 
-    y += gap;
-    CreateLabel(hwnd, L"Scan interval", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_SCAN_MIN, leftEditX, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"to", leftEditX + 82, y, 24, rowH);
-    CreateEdit(hwnd, IDC_SCAN_MAX, leftEditX + 112, y - 3, smallEditW, rowH);
-    CreateLabel(hwnd, L"ms", leftEditX + 194, y, 30, rowH);
+    CreateSectionHeader(hwnd, L"CONTROL", middleX, 352, 76);
+    CreateSeparator(hwnd, 510, 362, 280);
+    CreateLabel(hwnd, L"Start / Stop hotkey", middleX, 392, 150, 20);
+    CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, middleFieldX, 388, 90, rowH);
 
-    y += gap;
-    CreateWindowExW(0, L"BUTTON", L"Only fire while held",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    leftLabelX, y - 2, 180, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_REQUIRE_HELD_INPUT), GetModuleHandleW(nullptr), nullptr);
-    CreateLabel(hwnd, L"Held input", rightLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_HELD_INPUT_KEY, rightEditX, y - 3, editW, rowH);
-
-    y += gap;
-    CreateWindowExW(0, L"BUTTON", L"Prioritize left click",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    leftLabelX, y - 2, 300, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_PRIORITIZE_LEFT_CLICK), GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"BUTTON", L"Stop WASD while color is detected",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                    rightLabelX, y - 2, 300, rowH,
-                    hwnd, reinterpret_cast<HMENU>(IDC_STOP_MOVEMENT), GetModuleHandleW(nullptr), nullptr);
-
-    y += gap;
-    CreateLabel(hwnd, L"Start/Stop hotkey", leftLabelX, y, labelW, rowH);
-    CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, leftEditX, y - 3, editW, rowH);
-
-    CreateLabel(hwnd, L"Arduino COM port", rightLabelX, y, labelW, rowH);
-    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, rightEditX, y - 3, editW, 180);
+    CreateSectionHeader(hwnd, L"DEVICE", middleX, 432, 62);
+    CreateSeparator(hwnd, 496, 442, 294);
+    CreateLabel(hwnd, L"Arduino COM port", middleX, 472, 150, 20);
+    HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, middleFieldX, 468, 90, 180);
     PopulateSerialPortChoices(serialPort);
-    g_app.serialStatus = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"Serial: idle",
-                                         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_CENTER,
-                                         rightUnitX, y - 3, 128, rowH,
-                                         hwnd, reinterpret_cast<HMENU>(IDC_SERIAL_STATUS), GetModuleHandleW(nullptr), nullptr);
+    g_app.serialStatus = CreateStaticField(hwnd, IDC_SERIAL_STATUS, L"Serial: idle", 690, 468, 110, rowH,
+                                           SS_CENTERIMAGE | SS_CENTER);
 
-    CreateLabel(hwnd, L"Live preview", previewX, 16, 140, 20);
+    CreateSectionHeader(hwnd, L"LIVE PREVIEW", PREVIEW_X, 84, 96);
+    CreateSeparator(hwnd, 930, 94, 250);
     g_app.preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"minhanbotPreview", L"",
                                     WS_CHILD | WS_VISIBLE,
-                                    previewX, 42, 200, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                    ScaleUi(PREVIEW_X), ScaleUi(PREVIEW_Y),
+                                    ScaleUi(PREVIEW_MAX_WIDTH), ScaleUi(PREVIEW_MAX_HEIGHT),
+                                    hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-                                  previewX, 268, 340, 56, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  ScaleUi(PREVIEW_X), ScaleUi(PREVIEW_Y + PREVIEW_MAX_HEIGHT + PREVIEW_STATS_GAP),
+                                  ScaleUi(PREVIEW_STATS_WIDTH), ScaleUi(PREVIEW_STATS_HEIGHT),
+                                  hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetUiFont(g_app.stats);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -1991,12 +2128,16 @@ bool ApplyConfig(HWND hwnd) {
     }
 
     if (g_app.registeredHotkey != cfg.toggleHotkey) {
+        const DWORD previousHotkey = g_app.registeredHotkey;
         if (g_app.registeredHotkey != 0) {
             UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
             g_app.registeredHotkey = 0;
         }
 
         if (!RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, cfg.toggleHotkey)) {
+            if (previousHotkey != 0 && RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, previousHotkey)) {
+                g_app.registeredHotkey = previousHotkey;
+            }
             MessageBoxW(hwnd, L"That Start/Stop hotkey is already in use. Pick another key.", L"Hotkey unavailable", MB_ICONWARNING | MB_OK);
             return false;
         }
@@ -2007,6 +2148,7 @@ bool ApplyConfig(HWND hwnd) {
         std::lock_guard<std::mutex> lock(g_app.configMutex);
         g_app.config = cfg;
     }
+    ResizePreviewForCapture(cfg.captureWidth, cfg.captureHeight);
     return true;
 }
 
@@ -2083,6 +2225,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE:
         g_app.hwnd = hwnd;
         EnableDarkTitleBar(hwnd);
+        CreateUiFonts();
         CreateMainControls(hwnd);
         ApplyConfig(hwnd);
         g_app.keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(nullptr), 0);
@@ -2128,7 +2271,27 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HDC hdc = reinterpret_cast<HDC>(wParam);
         HWND child = reinterpret_cast<HWND>(lParam);
         const int id = GetDlgCtrlID(child);
-        if (id == IDC_STATUS || id == IDC_TARGET_COLOR) {
+        if (id == IDC_SECTION_HEADER) {
+            ApplyCtlColor(hdc, THEME_BG, THEME_ACCENT);
+            return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
+        }
+        if (id == IDC_SEPARATOR) {
+            ApplyCtlColor(hdc, THEME_BORDER, THEME_BORDER);
+            return reinterpret_cast<LRESULT>(ThemeBorderBrush());
+        }
+        if (id == IDC_STATUS) {
+            wchar_t status[32]{};
+            GetWindowTextW(child, status, static_cast<int>(sizeof(status) / sizeof(status[0])));
+            COLORREF fg = THEME_MUTED;
+            if (wcscmp(status, L"Armed") == 0) {
+                fg = RGB(85, 230, 120);
+            } else if (wcscmp(status, L"Detected") == 0) {
+                fg = THEME_ACCENT;
+            }
+            ApplyCtlColor(hdc, THEME_PANEL, fg);
+            return reinterpret_cast<LRESULT>(ThemePanelBrush());
+        }
+        if (id == IDC_TARGET_COLOR || id == IDC_TOLERANCE_VALUE) {
             ApplyCtlColor(hdc, THEME_PANEL);
             return reinterpret_cast<LRESULT>(ThemePanelBrush());
         }
@@ -2269,6 +2432,14 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_app.worker.joinable()) {
             g_app.worker.join();
         }
+        if (g_app.uiFont) {
+            DeleteObject(g_app.uiFont);
+            g_app.uiFont = nullptr;
+        }
+        if (g_app.sectionFont) {
+            DeleteObject(g_app.sectionFont);
+            g_app.sectionFont = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
 
@@ -2279,6 +2450,13 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    SetProcessDPIAware();
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc) {
+        g_uiDpi = static_cast<UINT>(GetDeviceCaps(screenDc, LOGPIXELSX));
+        ReleaseDC(nullptr, screenDc);
+    }
+
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);
     commonControls.dwICC = ICC_BAR_CLASSES;
@@ -2311,7 +2489,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         L"minhanbot",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1400, 490,
+        ScaleUi(1220), ScaleUi(590),
         nullptr,
         nullptr,
         hInstance,

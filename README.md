@@ -21,7 +21,7 @@ Type a profile name, adjust the controls, then press `Save`. The app writes prof
 
 Choose a saved profile and press `Load` to restore its settings. `Default` always means the built-in defaults from the source code.
 
-Built-in defaults include a 25 px by 20 px capture area, a 1-2 ms bell-curve delay before pressing the key, a 1-2 ms key-hold duration, and a 1-2 ms release delay.
+Built-in defaults include a 30 px by 25 px capture area, a 1-2 ms bell-curve delay before pressing the key, a 1-2 ms key-hold duration, and a 1-2 ms release delay.
 
 ## External Arduino input
 
