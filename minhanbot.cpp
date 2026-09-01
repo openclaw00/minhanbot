@@ -127,7 +127,10 @@ constexpr UINT WM_APP_STATUS = WM_APP + 2;
 constexpr UINT WM_APP_STATS = WM_APP + 3;
 constexpr UINT WM_APP_PICKED_COLOR = WM_APP + 4;
 constexpr UINT WM_APP_SERIAL_STATUS = WM_APP + 5;
+constexpr UINT WM_APP_CAPTURE_STATUS = WM_APP + 6;
 constexpr int TOGGLE_HOTKEY_ID = 1;
+constexpr UINT_PTR TOGGLE_MOUSE_TIMER_ID = 2;
+constexpr UINT TOGGLE_MOUSE_POLL_MS = 10;
 
 // Control identifiers.
 constexpr int IDC_START = 1001;
@@ -166,6 +169,7 @@ constexpr int IDC_PRIORITIZE_LEFT_CLICK = 1034;
 constexpr int IDC_STOP_MOVEMENT = 1035;
 constexpr int IDC_SECTION_HEADER = 1036;
 constexpr int IDC_SEPARATOR = 1037;
+constexpr int IDC_CAPTURE_STATUS = 1038;
 
 // Preview layout. The configured capture is scaled to fit this bounding box.
 constexpr int PREVIEW_X = 820;
@@ -175,6 +179,8 @@ constexpr int PREVIEW_MAX_HEIGHT = 280;
 constexpr int PREVIEW_STATS_GAP = 18;
 constexpr int PREVIEW_STATS_WIDTH = 360;
 constexpr int PREVIEW_STATS_HEIGHT = 56;
+constexpr int PREVIEW_CAPTURE_STATUS_GAP = 4;
+constexpr int PREVIEW_CAPTURE_STATUS_HEIGHT = 34;
 
 // Black-and-white dark UI theme.
 constexpr COLORREF THEME_BG = RGB(8, 8, 8);
@@ -197,6 +203,12 @@ enum class StatusKind : int {
 enum class SerialStatusKind : int {
     Idle,
     Connected,
+    Error
+};
+
+enum class CaptureStatusKind : int {
+    Idle,
+    Active,
     Error
 };
 
@@ -248,9 +260,11 @@ struct AppState {
     HWND profileLoad = nullptr;
     HWND profileSave = nullptr;
     HWND serialStatus = nullptr;
+    HWND captureStatus = nullptr;
     HFONT uiFont = nullptr;
     HFONT sectionFont = nullptr;
-    DWORD registeredHotkey = 0;
+    DWORD activeToggleHotkey = 0;
+    bool toggleMouseButtonDown = false;
 
     std::atomic_bool armed{false};
     std::atomic_bool shuttingDown{false};
@@ -263,6 +277,8 @@ struct AppState {
     std::atomic_int closestB{0};
     std::atomic_int closestDelta{0};
     std::atomic_int serialStatusKind{static_cast<int>(SerialStatusKind::Idle)};
+    std::atomic_int captureStatusKind{static_cast<int>(CaptureStatusKind::Idle)};
+    std::atomic_int captureFpsTenths{0};
     std::thread worker;
     HHOOK keyboardHook = nullptr;
 
@@ -272,6 +288,10 @@ struct AppState {
 
     std::mutex frameMutex;
     FrameBuffer latestFrame;
+
+    std::mutex diagnosticMutex;
+    std::wstring serialStatusText{L"Serial: idle - waiting for first command"};
+    std::wstring captureStatusText{L"Capture: idle"};
 };
 
 AppState g_app;
@@ -299,7 +319,8 @@ void SetUiFont(HWND hwnd, bool section = false) {
     }
 }
 
-void PostSerialStatus(SerialStatusKind status);
+void PostSerialStatus(SerialStatusKind status, const std::wstring& message = L"");
+void PostCaptureStatus(CaptureStatusKind status, const std::wstring& message);
 
 bool IsMovementKey(DWORD vk) {
     return vk == L'W' || vk == L'A' || vk == L'S' || vk == L'D';
@@ -384,6 +405,15 @@ int ClampInt(int value, int lo, int hi) {
     return std::max(lo, std::min(value, hi));
 }
 
+std::wstring WithHresult(const wchar_t* message, HRESULT hr) {
+    if (SUCCEEDED(hr)) {
+        hr = E_FAIL;
+    }
+    wchar_t code[24]{};
+    wsprintfW(code, L" (0x%08lX)", static_cast<unsigned long>(hr));
+    return std::wstring(message) + code;
+}
+
 class ScreenCapture {
 public:
     ScreenCapture() = default;
@@ -401,10 +431,11 @@ public:
         }
 
         reset();
+        lastError_.clear();
 
         const HRESULT initHr = RoInitialize(RO_INIT_MULTITHREADED);
         if (FAILED(initHr) && initHr != RPC_E_CHANGED_MODE) {
-            return false;
+            return fail(L"Capture initialization failed", initHr);
         }
         roInitialized_ = SUCCEEDED(initHr);
 
@@ -420,14 +451,14 @@ public:
             nullptr,
             &context_);
         if (FAILED(hr)) {
-            return false;
+            return fail(L"Direct3D capture device creation failed", hr);
         }
 
         IDXGIDevice* dxgiDevice = nullptr;
         hr = device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
         if (FAILED(hr) || !dxgiDevice) {
-            reset();
-            return false;
+            SafeRelease(dxgiDevice);
+            return fail(L"Direct3D capture interface is unavailable", hr);
         }
 
         const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -442,8 +473,7 @@ public:
         monitorInfo.cbSize = sizeof(monitorInfo);
         if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
             SafeRelease(dxgiDevice);
-            reset();
-            return false;
+            return fail(L"Could not identify the monitor at the desktop center", HRESULT_FROM_WIN32(GetLastError()));
         }
 
         HMODULE d3d11Module = GetModuleHandleW(L"d3d11.dll");
@@ -451,8 +481,7 @@ public:
             d3d11Module, "CreateDirect3D11DeviceFromDXGIDevice");
         if (!createWinRtDevice) {
             SafeRelease(dxgiDevice);
-            reset();
-            return false;
+            return fail(L"Windows Graphics Capture is unavailable on this Windows version", E_NOINTERFACE);
         }
 
         IInspectable* direct3DDeviceInspectable = nullptr;
@@ -465,8 +494,7 @@ public:
         }
         SafeRelease(direct3DDeviceInspectable);
         if (FAILED(hr)) {
-            reset();
-            return false;
+            return fail(L"Could not create the Windows Graphics Capture device", hr);
         }
 
         outputLeft_ = monitorInfo.rcMonitor.left;
@@ -474,15 +502,17 @@ public:
         outputWidth_ = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
         outputHeight_ = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
         if (width > outputWidth_ || height > outputHeight_) {
-            reset();
-            return false;
+            return fail(L"The capture area is larger than the selected monitor", E_INVALIDARG);
         }
 
         HSTRING itemClass = nullptr;
-        WindowsCreateString(
+        hr = WindowsCreateString(
             L"Windows.Graphics.Capture.GraphicsCaptureItem",
             static_cast<UINT32>(wcslen(L"Windows.Graphics.Capture.GraphicsCaptureItem")),
             &itemClass);
+        if (FAILED(hr)) {
+            return fail(L"Could not initialize the capture item", hr);
+        }
         IGraphicsCaptureItemInterop* itemInterop = nullptr;
         hr = RoGetActivationFactory(itemClass, __uuidof(IGraphicsCaptureItemInterop),
             reinterpret_cast<void**>(&itemInterop));
@@ -495,15 +525,17 @@ public:
         }
         SafeRelease(itemInterop);
         if (FAILED(hr) || !captureItem_) {
-            reset();
-            return false;
+            return fail(L"Windows could not capture the selected monitor", hr);
         }
 
         HSTRING poolClass = nullptr;
-        WindowsCreateString(
+        hr = WindowsCreateString(
             L"Windows.Graphics.Capture.Direct3D11CaptureFramePool",
             static_cast<UINT32>(wcslen(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool")),
             &poolClass);
+        if (FAILED(hr)) {
+            return fail(L"Could not initialize the capture frame pool", hr);
+        }
         ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2* poolStatics = nullptr;
         hr = RoGetActivationFactory(
             poolClass,
@@ -521,14 +553,12 @@ public:
         }
         SafeRelease(poolStatics);
         if (FAILED(hr) || !framePool_) {
-            reset();
-            return false;
+            return fail(L"Could not create the capture frame pool", hr);
         }
 
         hr = framePool_->CreateCaptureSession(captureItem_, &session_);
         if (FAILED(hr) || !session_) {
-            reset();
-            return false;
+            return fail(L"Could not create the capture session", hr);
         }
 
         // Ask Windows Graphics Capture not to draw the colored capture border.
@@ -540,9 +570,9 @@ public:
         }
         SafeRelease(session3);
 
-        if (FAILED(session_->StartCapture())) {
-            reset();
-            return false;
+        hr = session_->StartCapture();
+        if (FAILED(hr)) {
+            return fail(L"Windows refused to start screen capture", hr);
         }
 
         D3D11_TEXTURE2D_DESC textureDesc{};
@@ -557,8 +587,7 @@ public:
 
         hr = device_->CreateTexture2D(&textureDesc, nullptr, &staging_);
         if (FAILED(hr)) {
-            reset();
-            return false;
+            return fail(L"Could not allocate the capture buffer", hr);
         }
 
         width_ = width;
@@ -568,7 +597,9 @@ public:
     }
 
     bool captureCentered() {
+        lastError_.clear();
         if (!framePool_ || !context_ || !staging_) {
+            lastError_ = L"Capture session is not initialized";
             return false;
         }
 
@@ -585,6 +616,9 @@ public:
         HRESULT hr = framePool_->TryGetNextFrame(&frame);
         if (FAILED(hr) || !frame) {
             // No fresh frame means no detection. Never scan stale pixels.
+            if (FAILED(hr)) {
+                lastError_ = WithHresult(L"Could not read the next capture frame", hr);
+            }
             return false;
         }
 
@@ -605,6 +639,7 @@ public:
         if (FAILED(hr) || !frameTexture) {
             CloseWinRtObject(frame);
             SafeRelease(frame);
+            lastError_ = WithHresult(L"Could not access the captured frame texture", hr);
             return false;
         }
 
@@ -634,6 +669,9 @@ public:
 
         CloseWinRtObject(frame);
         SafeRelease(frame);
+        if (FAILED(hr)) {
+            lastError_ = WithHresult(L"Could not read pixels from the capture buffer", hr);
+        }
         return SUCCEEDED(hr);
     }
 
@@ -653,7 +691,20 @@ public:
         return static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_) * 4u;
     }
 
+    const std::wstring& lastError() const {
+        return lastError_;
+    }
+
 private:
+    bool fail(const wchar_t* message, HRESULT hr) {
+        reset();
+        if (SUCCEEDED(hr)) {
+            hr = E_FAIL;
+        }
+        lastError_ = WithHresult(message, hr);
+        return false;
+    }
+
     void reset() {
         SafeRelease(staging_);
         CloseWinRtObject(session_);
@@ -692,6 +743,7 @@ private:
     int outputWidth_ = 0;
     int outputHeight_ = 0;
     bool roInitialized_ = false;
+    std::wstring lastError_;
 };
 
 int SampleBellCurveMs(std::mt19937& rng, int minMs, int maxMs) {
@@ -752,6 +804,16 @@ DetectionResult AnalyzeTargetColors(
     return result;
 }
 
+std::wstring ComFailureMessage(const std::wstring& port, const wchar_t* operation, DWORD error) {
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+        return port + L" not found - check the cable and selected COM port";
+    }
+    if (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION) {
+        return port + L" is busy or access was denied - close other serial apps";
+    }
+    return port + L": " + operation + L" failed (Windows error " + std::to_wstring(error) + L")";
+}
+
 class SerialHidBridge {
 public:
     SerialHidBridge() = default;
@@ -765,7 +827,7 @@ public:
 
     bool send(bool down, DWORD vk, const std::wstring& port) {
         if (!ensureOpen(port)) {
-            PostSerialStatus(SerialStatusKind::Error);
+            PostSerialStatus(SerialStatusKind::Error, lastError_);
             return false;
         }
 
@@ -774,12 +836,27 @@ public:
 
         DWORD written = 0;
         const DWORD length = static_cast<DWORD>(std::strlen(command));
-        if (!WriteFile(handle_, command, length, &written, nullptr) || written != length) {
+        const auto writeStarted = std::chrono::steady_clock::now();
+        const BOOL writeSucceeded = WriteFile(handle_, command, length, &written, nullptr);
+        const auto latencyUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - writeStarted).count();
+        if (!writeSucceeded || written != length) {
+            const DWORD error = writeSucceeded ? ERROR_WRITE_FAULT : GetLastError();
+            lastError_ = ComFailureMessage(port, L"serial write", error);
             close();
-            PostSerialStatus(SerialStatusKind::Error);
+            PostSerialStatus(SerialStatusKind::Error, lastError_);
             return false;
         }
-        PostSerialStatus(SerialStatusKind::Connected);
+
+        const long long latencyTenthsMs = std::max(0LL, (latencyUs + 50LL) / 100LL);
+        const std::wstring latency = std::to_wstring(latencyTenthsMs / 10LL) + L"." +
+                                     std::to_wstring(latencyTenthsMs % 10LL) + L" ms";
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextStatusUi_) {
+            PostSerialStatus(SerialStatusKind::Connected,
+                             port + L": connected - write " + latency);
+            nextStatusUi_ = now + std::chrono::milliseconds(100);
+        }
         return true;
     }
 
@@ -805,13 +882,16 @@ private:
             FILE_ATTRIBUTE_NORMAL,
             nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) {
+            lastError_ = ComFailureMessage(port, L"open", GetLastError());
             return false;
         }
 
         DCB dcb{};
         dcb.DCBlength = sizeof(dcb);
         if (!GetCommState(handle_, &dcb)) {
+            const DWORD error = GetLastError();
             close();
+            lastError_ = ComFailureMessage(port, L"read serial settings", error);
             return false;
         }
         dcb.BaudRate = CBR_115200;
@@ -821,7 +901,9 @@ private:
         dcb.fDtrControl = DTR_CONTROL_DISABLE;
         dcb.fRtsControl = RTS_CONTROL_DISABLE;
         if (!SetCommState(handle_, &dcb)) {
+            const DWORD error = GetLastError();
             close();
+            lastError_ = ComFailureMessage(port, L"configure 115200 baud", error);
             return false;
         }
 
@@ -829,11 +911,14 @@ private:
         timeouts.WriteTotalTimeoutConstant = 20;
         timeouts.WriteTotalTimeoutMultiplier = 1;
         if (!SetCommTimeouts(handle_, &timeouts)) {
+            const DWORD error = GetLastError();
             close();
+            lastError_ = ComFailureMessage(port, L"configure write timeout", error);
             return false;
         }
 
         openPort_ = port;
+        lastError_.clear();
         return true;
     }
 
@@ -843,10 +928,13 @@ private:
             handle_ = INVALID_HANDLE_VALUE;
         }
         openPort_.clear();
+        nextStatusUi_ = std::chrono::steady_clock::time_point{};
     }
 
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     std::wstring openPort_;
+    std::wstring lastError_;
+    std::chrono::steady_clock::time_point nextStatusUi_{};
 };
 
 class KeyOutput {
@@ -918,9 +1006,31 @@ void PostStatus(StatusKind status) {
     }
 }
 
-void PostSerialStatus(SerialStatusKind status) {
+void PostSerialStatus(SerialStatusKind status, const std::wstring& message) {
+    std::wstring resolved = message;
+    if (resolved.empty()) {
+        resolved = status == SerialStatusKind::Idle
+            ? L"Serial: idle - waiting for first command"
+            : (status == SerialStatusKind::Connected ? L"Serial: connected" : L"Serial: error");
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_app.diagnosticMutex);
+        g_app.serialStatusText = std::move(resolved);
+    }
+    g_app.serialStatusKind.store(static_cast<int>(status), std::memory_order_relaxed);
     if (g_app.hwnd) {
         PostMessageW(g_app.hwnd, WM_APP_SERIAL_STATUS, static_cast<WPARAM>(status), 0);
+    }
+}
+
+void PostCaptureStatus(CaptureStatusKind status, const std::wstring& message) {
+    {
+        std::lock_guard<std::mutex> lock(g_app.diagnosticMutex);
+        g_app.captureStatusText = message;
+    }
+    g_app.captureStatusKind.store(static_cast<int>(status), std::memory_order_relaxed);
+    if (g_app.hwnd) {
+        PostMessageW(g_app.hwnd, WM_APP_CAPTURE_STATUS, static_cast<WPARAM>(status), 0);
     }
 }
 
@@ -949,11 +1059,23 @@ void WorkerMain() {
     auto releaseAt = std::chrono::steady_clock::now();
     auto nextHeldKeyRefresh = std::chrono::steady_clock::now();
     int nonHoldPressesSinceCooldown = 0;
-    bool nonHoldDetectionConsumed = false;
-    bool holdDetectionSuppressedByMouse = false;
+    bool wasArmed = false;
+    bool captureDiagnosticActive = false;
+    std::wstring lastCaptureError;
+    int activeCaptureWidth = 0;
+    int activeCaptureHeight = 0;
+    int fpsFrameCount = 0;
+    auto fpsWindowStarted = std::chrono::steady_clock::now();
 
     while (!g_app.shuttingDown.load(std::memory_order_relaxed)) {
         if (!g_app.armed.load(std::memory_order_relaxed)) {
+            if (wasArmed) {
+                g_app.captureFpsTenths.store(0, std::memory_order_relaxed);
+                PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
+                wasArmed = false;
+                captureDiagnosticActive = false;
+                fpsFrameCount = 0;
+            }
             SetMovementSuppressed(false);
             if (keyHeld) {
                 output.up(heldConfig, heldKey);
@@ -963,10 +1085,14 @@ void WorkerMain() {
             releasePending = false;
             nextHeldKeyRefresh = std::chrono::steady_clock::now();
             nonHoldPressesSinceCooldown = 0;
-            nonHoldDetectionConsumed = false;
-            holdDetectionSuppressedByMouse = false;
             Sleep(10);
             continue;
+        }
+
+        if (!wasArmed) {
+            wasArmed = true;
+            fpsFrameCount = 0;
+            fpsWindowStarted = std::chrono::steady_clock::now();
         }
 
         RuntimeConfig cfg;
@@ -982,13 +1108,30 @@ void WorkerMain() {
 
         if (!capture.ensure(cfg.captureWidth, cfg.captureHeight)) {
             SetMovementSuppressed(false);
-            PostStatus(StatusKind::Disarmed);
             g_app.armed.store(false, std::memory_order_relaxed);
+            g_app.captureFpsTenths.store(0, std::memory_order_relaxed);
+            captureDiagnosticActive = false;
+            PostCaptureStatus(CaptureStatusKind::Error, L"Capture error: " + capture.lastError());
+            PostStatus(StatusKind::Disarmed);
+            PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
             Sleep(50);
             continue;
         }
 
-        if (capture.captureCentered()) {
+        const bool capturedFrame = capture.captureCentered();
+        if (capturedFrame) {
+            ++fpsFrameCount;
+            lastCaptureError.clear();
+            if (!captureDiagnosticActive ||
+                activeCaptureWidth != cfg.captureWidth || activeCaptureHeight != cfg.captureHeight) {
+                PostCaptureStatus(
+                    CaptureStatusKind::Active,
+                    L"Capture active - " + std::to_wstring(cfg.captureWidth) + L" x " +
+                        std::to_wstring(cfg.captureHeight) + L" px");
+                captureDiagnosticActive = true;
+                activeCaptureWidth = cfg.captureWidth;
+                activeCaptureHeight = cfg.captureHeight;
+            }
             {
                 std::lock_guard<std::mutex> lock(g_app.frameMutex);
                 g_app.latestFrame.width = capture.width();
@@ -1020,20 +1163,11 @@ void WorkerMain() {
 
             const bool heldInputActive = RequiredHeldInputActive(cfg);
             const bool leftClickHeld = PrioritizedLeftClickHeld(cfg);
-            if (!detection.detected) {
-                nonHoldDetectionConsumed = false;
-                holdDetectionSuppressedByMouse = false;
-            }
 
+            // Left-click priority is a live gate, not a detection-edge latch. A
+            // blocked or failed attempt must remain eligible on the next frame.
             if (cfg.holdWhileVisible) {
                 nonHoldPressesSinceCooldown = 0;
-                nonHoldDetectionConsumed = false;
-
-                // Once the mouse wins a newly detected activation, do not start the
-                // generated key after mouse-up; wait for the color to disappear first.
-                if (detection.detected && leftClickHeld && !keyHeld) {
-                    holdDetectionSuppressedByMouse = true;
-                }
 
                 // If the mouse arrives after the generated key-down, keep the key down.
                 // Releasing it here can cancel a game's shared mouse/keyboard fire action.
@@ -1049,7 +1183,7 @@ void WorkerMain() {
                         }
                     }
                     PostStatus(StatusKind::Detected);
-                } else if (detection.detected && heldInputActive && !holdDetectionSuppressedByMouse) {
+                } else if (detection.detected && heldInputActive && !leftClickHeld) {
                     PostStatus(StatusKind::Detected);
                     releasePending = false;
 
@@ -1113,13 +1247,7 @@ void WorkerMain() {
                 }
             } else if (detection.detected &&
                        heldInputActive &&
-                       (!cfg.prioritizeLeftClick || !nonHoldDetectionConsumed)) {
-                if (cfg.prioritizeLeftClick) {
-                    // Consume this color appearance even when the mouse wins, so the
-                    // generated key cannot fire immediately after mouse-up.
-                    nonHoldDetectionConsumed = true;
-                }
-
+                       !leftClickHeld) {
                 if (keyHeld) {
                     output.up(heldConfig, heldKey);
                     keyHeld = false;
@@ -1168,6 +1296,25 @@ void WorkerMain() {
             }
         } else {
             SetMovementSuppressed(false);
+            if (!capture.lastError().empty() && capture.lastError() != lastCaptureError) {
+                PostCaptureStatus(CaptureStatusKind::Error, L"Capture error: " + capture.lastError());
+                captureDiagnosticActive = false;
+                lastCaptureError = capture.lastError();
+            }
+        }
+
+        const auto fpsNow = std::chrono::steady_clock::now();
+        const auto fpsElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            fpsNow - fpsWindowStarted).count();
+        if (fpsElapsedMs >= 500) {
+            const long long fpsTenths = (static_cast<long long>(fpsFrameCount) * 10000LL + fpsElapsedMs / 2LL) /
+                                        fpsElapsedMs;
+            g_app.captureFpsTenths.store(
+                static_cast<int>(std::min<long long>(fpsTenths, std::numeric_limits<int>::max())),
+                std::memory_order_relaxed);
+            fpsFrameCount = 0;
+            fpsWindowStarted = fpsNow;
+            PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
         }
 
         const int scanIntervalMs = SampleBellCurveMs(rng, cfg.scanIntervalMin, cfg.scanIntervalMax);
@@ -1631,8 +1778,14 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
         !ParseIntControl(hwnd, IDC_SCAN_MIN, next.scanIntervalMin) ||
         !ParseIntControl(hwnd, IDC_SCAN_MAX, next.scanIntervalMax) ||
         !ParseVirtualKeyControl(hwnd, IDC_HELD_INPUT_KEY, next.heldInputKey, true) ||
-        !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey)) {
-        error = L"One or more fields are invalid. Key to press accepts keyboard keys; Held input also accepts RBUTTON.";
+        !ParseVirtualKeyControl(hwnd, IDC_TOGGLE_HOTKEY, next.toggleHotkey, true)) {
+        error = L"One or more fields are invalid. Held input and Start/Stop also accept RBUTTON.";
+        return false;
+    }
+
+    if (next.toggleHotkey == VK_LBUTTON || next.toggleHotkey == VK_MBUTTON ||
+        next.toggleHotkey == VK_XBUTTON1 || next.toggleHotkey == VK_XBUTTON2) {
+        error = L"Start/Stop supports keyboard keys or RBUTTON.";
         return false;
     }
 
@@ -1667,6 +1820,10 @@ bool ReadConfigFromControls(HWND hwnd, RuntimeConfig& cfg, std::wstring& error) 
     next.requireHeldInput = IsDlgButtonChecked(hwnd, IDC_REQUIRE_HELD_INPUT) == BST_CHECKED;
     next.prioritizeLeftClick = IsDlgButtonChecked(hwnd, IDC_PRIORITIZE_LEFT_CLICK) == BST_CHECKED;
     next.stopMovementOnDetect = IsDlgButtonChecked(hwnd, IDC_STOP_MOVEMENT) == BST_CHECKED;
+    if (next.requireHeldInput && next.heldInputKey == next.toggleHotkey) {
+        error = L"Held input and Start/Stop cannot use the same key while held-input gating is enabled.";
+        return false;
+    }
     next.serialPort = TrimUpper(GetWindowTextString(GetDlgItem(hwnd, IDC_SERIAL_PORT)));
     if (!IsSerialPortNameValid(next.serialPort)) {
         error = L"External Arduino input needs a COM port like COM3.";
@@ -1879,12 +2036,21 @@ void ResizePreviewForCapture(int captureWidth, int captureHeight) {
                ScaleUi(previewX), ScaleUi(PREVIEW_Y),
                ScaleUi(previewWidth), ScaleUi(previewHeight), TRUE);
     if (g_app.stats) {
+        const int statsY = PREVIEW_Y + previewHeight + PREVIEW_STATS_GAP;
         MoveWindow(g_app.stats,
                    ScaleUi(PREVIEW_X),
-                   ScaleUi(PREVIEW_Y + previewHeight + PREVIEW_STATS_GAP),
+                   ScaleUi(statsY),
                    ScaleUi(PREVIEW_STATS_WIDTH),
                    ScaleUi(PREVIEW_STATS_HEIGHT),
                    TRUE);
+        if (g_app.captureStatus) {
+            MoveWindow(g_app.captureStatus,
+                       ScaleUi(PREVIEW_X),
+                       ScaleUi(statsY + PREVIEW_STATS_HEIGHT + PREVIEW_CAPTURE_STATUS_GAP),
+                       ScaleUi(PREVIEW_STATS_WIDTH),
+                       ScaleUi(PREVIEW_CAPTURE_STATUS_HEIGHT),
+                       TRUE);
+        }
     }
 }
 
@@ -2036,7 +2202,7 @@ void CreateMainControls(HWND hwnd) {
 
     CreateSectionHeader(hwnd, L"CONTROL", middleX, 352, 76);
     CreateSeparator(hwnd, 510, 362, 280);
-    CreateLabel(hwnd, L"Start / Stop hotkey", middleX, 392, 150, 20);
+    CreateLabel(hwnd, L"Start / Stop (RBUTTON)", middleX, 392, 164, 20);
     CreateEdit(hwnd, IDC_TOGGLE_HOTKEY, middleFieldX, 388, 90, rowH);
 
     CreateSectionHeader(hwnd, L"DEVICE", middleX, 432, 62);
@@ -2044,8 +2210,9 @@ void CreateMainControls(HWND hwnd) {
     CreateLabel(hwnd, L"Arduino COM port", middleX, 472, 150, 20);
     HWND serialPort = CreateCombo(hwnd, IDC_SERIAL_PORT, middleFieldX, 468, 90, 180);
     PopulateSerialPortChoices(serialPort);
-    g_app.serialStatus = CreateStaticField(hwnd, IDC_SERIAL_STATUS, L"Serial: idle", 690, 468, 110, rowH,
-                                           SS_CENTERIMAGE | SS_CENTER);
+    g_app.serialStatus = CreateStaticField(hwnd, IDC_SERIAL_STATUS,
+                                           L"Serial: idle - waiting for first command",
+                                           middleX, 504, 380, 34, SS_LEFT | SS_NOPREFIX);
 
     CreateSectionHeader(hwnd, L"LIVE PREVIEW", PREVIEW_X, 84, 96);
     CreateSeparator(hwnd, 930, 94, 250);
@@ -2054,12 +2221,17 @@ void CreateMainControls(HWND hwnd) {
                                     ScaleUi(PREVIEW_X), ScaleUi(PREVIEW_Y),
                                     ScaleUi(PREVIEW_MAX_WIDTH), ScaleUi(PREVIEW_MAX_HEIGHT),
                                     hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-    g_app.stats = CreateWindowExW(0, L"STATIC", L"Hits: 0  Closest: --",
+    g_app.stats = CreateWindowExW(0, L"STATIC", L"FPS: 0.0   Hits: 0  Closest: --",
                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
                                   ScaleUi(PREVIEW_X), ScaleUi(PREVIEW_Y + PREVIEW_MAX_HEIGHT + PREVIEW_STATS_GAP),
                                   ScaleUi(PREVIEW_STATS_WIDTH), ScaleUi(PREVIEW_STATS_HEIGHT),
                                   hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetUiFont(g_app.stats);
+    g_app.captureStatus = CreateStaticField(
+        hwnd, IDC_CAPTURE_STATUS, L"Capture: idle",
+        PREVIEW_X,
+        PREVIEW_Y + PREVIEW_MAX_HEIGHT + PREVIEW_STATS_GAP + PREVIEW_STATS_HEIGHT + PREVIEW_CAPTURE_STATUS_GAP,
+        PREVIEW_STATS_WIDTH, PREVIEW_CAPTURE_STATUS_HEIGHT, SS_LEFT | SS_NOPREFIX);
 
     PopulateDefaults(hwnd);
     EnableWindow(g_app.stop, FALSE);
@@ -2119,6 +2291,43 @@ void StartScreenColorPick(HWND hwnd) {
     }).detach();
 }
 
+bool IsMouseToggleHotkey(DWORD vk) {
+    return vk == VK_RBUTTON;
+}
+
+void DeactivateToggleHotkey(HWND hwnd) {
+    if (g_app.activeToggleHotkey == 0) {
+        return;
+    }
+
+    if (IsMouseToggleHotkey(g_app.activeToggleHotkey)) {
+        KillTimer(hwnd, TOGGLE_MOUSE_TIMER_ID);
+        g_app.toggleMouseButtonDown = false;
+    } else {
+        UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
+    }
+    g_app.activeToggleHotkey = 0;
+}
+
+bool ActivateToggleHotkey(HWND hwnd, DWORD vk) {
+    if (vk == 0) {
+        return false;
+    }
+
+    if (IsMouseToggleHotkey(vk)) {
+        g_app.toggleMouseButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (SetTimer(hwnd, TOGGLE_MOUSE_TIMER_ID, TOGGLE_MOUSE_POLL_MS, nullptr) == 0) {
+            g_app.toggleMouseButtonDown = false;
+            return false;
+        }
+    } else if (!RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, vk)) {
+        return false;
+    }
+
+    g_app.activeToggleHotkey = vk;
+    return true;
+}
+
 bool ApplyConfig(HWND hwnd) {
     RuntimeConfig cfg;
     std::wstring error;
@@ -2127,21 +2336,20 @@ bool ApplyConfig(HWND hwnd) {
         return false;
     }
 
-    if (g_app.registeredHotkey != cfg.toggleHotkey) {
-        const DWORD previousHotkey = g_app.registeredHotkey;
-        if (g_app.registeredHotkey != 0) {
-            UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
-            g_app.registeredHotkey = 0;
-        }
+    if (g_app.activeToggleHotkey != cfg.toggleHotkey) {
+        const DWORD previousHotkey = g_app.activeToggleHotkey;
+        DeactivateToggleHotkey(hwnd);
 
-        if (!RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, cfg.toggleHotkey)) {
-            if (previousHotkey != 0 && RegisterHotKey(hwnd, TOGGLE_HOTKEY_ID, 0, previousHotkey)) {
-                g_app.registeredHotkey = previousHotkey;
+        if (!ActivateToggleHotkey(hwnd, cfg.toggleHotkey)) {
+            if (previousHotkey != 0) {
+                ActivateToggleHotkey(hwnd, previousHotkey);
             }
-            MessageBoxW(hwnd, L"That Start/Stop hotkey is already in use. Pick another key.", L"Hotkey unavailable", MB_ICONWARNING | MB_OK);
+            MessageBoxW(hwnd,
+                        L"Could not activate that Start/Stop control. The keyboard key may already be in use.",
+                        L"Start/Stop control unavailable",
+                        MB_ICONWARNING | MB_OK);
             return false;
         }
-        g_app.registeredHotkey = cfg.toggleHotkey;
     }
 
     {
@@ -2198,6 +2406,9 @@ void StartMonitoring(HWND hwnd) {
         return;
     }
 
+    g_app.captureFpsTenths.store(0, std::memory_order_relaxed);
+    PostCaptureStatus(CaptureStatusKind::Idle, L"Capture: starting...");
+    PostMessageW(hwnd, WM_APP_STATS, 0, 0);
     g_app.armed.store(true, std::memory_order_relaxed);
     SetWindowTextW(g_app.status, L"Armed");
     EnableWindow(g_app.start, FALSE);
@@ -2206,6 +2417,9 @@ void StartMonitoring(HWND hwnd) {
 
 void StopMonitoring() {
     g_app.armed.store(false, std::memory_order_relaxed);
+    g_app.captureFpsTenths.store(0, std::memory_order_relaxed);
+    PostCaptureStatus(CaptureStatusKind::Idle, L"Capture: idle");
+    PostMessageW(g_app.hwnd, WM_APP_STATS, 0, 0);
     SetMovementSuppressed(false);
     SetWindowTextW(g_app.status, L"Disarmed");
     EnableWindow(g_app.start, TRUE);
@@ -2307,6 +2521,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ApplyCtlColor(hdc, THEME_PANEL, fg);
             return reinterpret_cast<LRESULT>(ThemePanelBrush());
         }
+        if (id == IDC_CAPTURE_STATUS) {
+            const CaptureStatusKind captureStatus = static_cast<CaptureStatusKind>(
+                g_app.captureStatusKind.load(std::memory_order_relaxed));
+            COLORREF fg = THEME_MUTED;
+            if (captureStatus == CaptureStatusKind::Active) {
+                fg = RGB(85, 230, 120);
+            } else if (captureStatus == CaptureStatusKind::Error) {
+                fg = RGB(255, 90, 90);
+            }
+            ApplyCtlColor(hdc, THEME_PANEL, fg);
+            return reinterpret_cast<LRESULT>(ThemePanelBrush());
+        }
         ApplyCtlColor(hdc, THEME_BG, THEME_MUTED);
         return reinterpret_cast<LRESULT>(ThemeBackgroundBrush());
     }
@@ -2340,6 +2566,20 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    case WM_TIMER:
+        if (wParam == TOGGLE_MOUSE_TIMER_ID && IsMouseToggleHotkey(g_app.activeToggleHotkey)) {
+            const bool rightButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+            const bool pressedNow = rightButtonDown && !g_app.toggleMouseButtonDown;
+            g_app.toggleMouseButtonDown = rightButtonDown;
+
+            // Ignore the toggle while the color picker owns global mouse input.
+            if (pressedNow && !g_app.colorPickActive.load(std::memory_order_relaxed)) {
+                ToggleMonitoring(hwnd);
+            }
+            return 0;
+        }
+        break;
+
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) == g_app.toleranceSlider) {
             SetToleranceValueText(GetToleranceSliderValue());
@@ -2357,21 +2597,30 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (static_cast<StatusKind>(wParam)) {
         case StatusKind::Disarmed:
             SetWindowTextW(g_app.status, L"Disarmed");
+            EnableWindow(g_app.start, TRUE);
+            EnableWindow(g_app.stop, FALSE);
             break;
         case StatusKind::Armed:
             SetWindowTextW(g_app.status, L"Armed");
+            EnableWindow(g_app.start, FALSE);
+            EnableWindow(g_app.stop, TRUE);
             break;
         case StatusKind::Detected:
             SetWindowTextW(g_app.status, L"Detected");
+            EnableWindow(g_app.start, FALSE);
+            EnableWindow(g_app.stop, TRUE);
             break;
         }
         return 0;
 
     case WM_APP_STATS: {
-        wchar_t text[128]{};
+        const int fpsTenths = std::max(0, g_app.captureFpsTenths.load(std::memory_order_relaxed));
+        wchar_t text[160]{};
         wsprintfW(
             text,
-            L"Hits: %d/%d\nClosest RGB: %d,%d,%d  RGB +/- %d",
+            L"Capture FPS: %d.%d   Hits: %d/%d\nClosest RGB: %d,%d,%d  RGB +/- %d",
+            fpsTenths / 10,
+            fpsTenths % 10,
             g_app.lastHits.load(std::memory_order_relaxed),
             g_app.requiredHits.load(std::memory_order_relaxed),
             g_app.closestR.load(std::memory_order_relaxed),
@@ -2393,22 +2642,27 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_APP_SERIAL_STATUS: {
-        const SerialStatusKind serialStatus = static_cast<SerialStatusKind>(wParam);
-        g_app.serialStatusKind.store(static_cast<int>(serialStatus), std::memory_order_relaxed);
         if (g_app.serialStatus) {
-            switch (serialStatus) {
-            case SerialStatusKind::Connected:
-                SetWindowTextW(g_app.serialStatus, L"Serial: connected");
-                break;
-            case SerialStatusKind::Error:
-                SetWindowTextW(g_app.serialStatus, L"Serial: error");
-                break;
-            case SerialStatusKind::Idle:
-            default:
-                SetWindowTextW(g_app.serialStatus, L"Serial: idle");
-                break;
+            std::wstring message;
+            {
+                std::lock_guard<std::mutex> lock(g_app.diagnosticMutex);
+                message = g_app.serialStatusText;
             }
+            SetWindowTextW(g_app.serialStatus, message.c_str());
             InvalidateRect(g_app.serialStatus, nullptr, TRUE);
+        }
+        return 0;
+    }
+
+    case WM_APP_CAPTURE_STATUS: {
+        if (g_app.captureStatus) {
+            std::wstring message;
+            {
+                std::lock_guard<std::mutex> lock(g_app.diagnosticMutex);
+                message = g_app.captureStatusText;
+            }
+            SetWindowTextW(g_app.captureStatus, message.c_str());
+            InvalidateRect(g_app.captureStatus, nullptr, TRUE);
         }
         return 0;
     }
@@ -2425,10 +2679,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UnhookWindowsHookEx(g_app.keyboardHook);
             g_app.keyboardHook = nullptr;
         }
-        if (g_app.registeredHotkey != 0) {
-            UnregisterHotKey(hwnd, TOGGLE_HOTKEY_ID);
-            g_app.registeredHotkey = 0;
-        }
+        DeactivateToggleHotkey(hwnd);
         if (g_app.worker.joinable()) {
             g_app.worker.join();
         }
